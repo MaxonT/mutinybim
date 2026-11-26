@@ -45,8 +45,11 @@ function run(model: ModelState, command: Record<string, unknown> & { type: strin
 
 const room: Room = { id: asElementId("rm-101"), version: 1, authoredRev: {}, kind: "room", number: "101", name: "Office", outline: rect(0, 0, 20 * FT, 10 * FT), areaSqM: 0, partition: { level: "L1", zone: "*", discipline: "architecture" } };
 
+/** A room made through the editor: it stores its area, and the outline (10 x 10 ft, 100 SF) is deliberately not the same, so only the stored value prints 200 SF. */
+const storedRoom: Room = { ...room, id: asElementId("rm-102"), number: "102", name: "Studio", outline: rect(0, 30 * FT, 10 * FT, 10 * FT), areaSqM: 18.58 };
+
 function sample(): ModelState {
-  let m: ModelState = { modelId: "room-space-tags", revision: 0 as ModelState["revision"], elements: { [room.id]: room }, connections: [], settings: DEFAULT_SETTINGS };
+  let m: ModelState = { modelId: "room-space-tags", revision: 0 as ModelState["revision"], elements: { [room.id]: room, [storedRoom.id]: storedRoom }, connections: [], settings: DEFAULT_SETTINGS };
   m = run(m, { type: "create_level", levelId: "lvl-1", name: "L1", elevationMm: 0 });
   m = run(m, { type: "create_space", spaces: [{ spaceId: "sp-1", number: "102", name: "Classroom", levelId: "lvl-1", outline: rect(30 * FT, 0, 30 * FT, 20 * FT) }] });
   return m;
@@ -75,6 +78,10 @@ describe("starter tag presets for rooms and spaces", () => {
 
   it("room name, number and area", () => {
     expect(tagText(base, "general.room_area", "rm-101")).toEqual(["Office", "101", "200 SF"]);
+  });
+
+  it("room area reads the stored area, not the outline", () => {
+    expect(tagText(base, "general.room_area", "rm-102")).toEqual(["Studio", "102", "200 SF"]);
   });
 
   it("space name and number", () => {
