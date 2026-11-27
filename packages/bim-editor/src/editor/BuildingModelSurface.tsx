@@ -79,6 +79,7 @@ const TrackpadHint = dynamic(() => import('./input/TrackpadHint').then((m) => m.
 const PhaseFiltersDialog = dynamic(() => import('./organization/PhaseFiltersDialog').then((m) => m.PhaseFiltersDialog), { ssr: false })
 const ManagePhasesDialog = dynamic(() => import('./organization/ManagePhasesDialog').then((m) => m.ManagePhasesDialog), { ssr: false })
 const CoordinatesDialog = dynamic(() => import('./orientation/CoordinatesDialog').then((m) => m.CoordinatesDialog), { ssr: false })
+const CameraTools = dynamic(() => import('./orientation/CameraTools'), { ssr: false })
 const NewViewDialog = dynamic(() => import('./views-sheets/ViewsSheetsDialogs').then((m) => m.NewViewDialog), { ssr: false })
 const SheetDialog = dynamic(() => import('./views-sheets/ViewsSheetsDialogs').then((m) => m.SheetDialog), { ssr: false })
 const ProjectInfoDialog = dynamic(() => import('./views-sheets/ProjectInfoDialog').then((m) => m.ProjectInfoDialog), { ssr: false })
@@ -329,6 +330,7 @@ export function BuildingModelSurface({ projectId, projectName, projectNumber, us
   /** Print dialog: the saved revision and how many of your unsaved edits touch the sheet, taken when it opened. */
   const [printing, setPrinting] = useState<{ savedRevision: number; pendingOnSheet: number } | null>(null)
   const [viewer, setViewer] = useState<ModelViewer3D | null>(null)
+  const [cameraToolsView, setCameraToolsView] = useState<string | null>(null)
   const [lightingPreset, setLightingPresetState] = useState<SceneLightingPreset>('noon')
   const applyLightingPreset = useCallback((next: SceneLightingPreset) => {
     setLightingPresetState(next)
@@ -747,6 +749,7 @@ export function BuildingModelSurface({ projectId, projectName, projectNumber, us
   const openKey = open.kind === 'model' ? `model:${open.mode}` : `${open.kind}:${open.id}:${openView?.version ?? 0}`
   // Switching projection keeps the picture, so saving it on the view must not re-frame the camera to the crop box.
   const cameraKey = open.kind === 'model' || !openView ? openKey : `${open.kind}:${open.id}:${framingSignature(openView)}`
+  const cameraToolsKey = `${model?.modelId}:${cameraKey}`
 
   // Before the camera effect, so a saved orthographic view opens orthographic.
   useEffect(() => {
@@ -3475,6 +3478,7 @@ export function BuildingModelSurface({ projectId, projectName, projectNumber, us
         <div className="relative min-w-0 flex-1 bg-muted/40">
           <div
             ref={canvasRef}
+            tabIndex={-1}
             data-testid="building-model-canvas"
             data-camera={cameraStill ? 'still' : 'moving'}
             className={showDrawing ? 'hidden' : 'absolute inset-0 touch-none'}
@@ -3651,7 +3655,15 @@ export function BuildingModelSurface({ projectId, projectName, projectNumber, us
               onCreateElevation={(side) => void createElevation(side)}
               projection={projection}
               onProjectionChange={changeProjection}
+              cameraToolsOpen={cameraToolsView === cameraToolsKey}
+              onCameraTools={() => setCameraToolsView(cameraToolsView === cameraToolsKey ? null : cameraToolsKey)}
             />
+          )}
+          {viewer && live3dOpen && !scheduleGridOpen && !loadError && cameraToolsView === cameraToolsKey && (
+            <ModelFromStore store={modelStore}>{shown => shown && (
+              <CameraTools key={cameraToolsKey} viewer={viewer} model={shown} initialLevel={activeLevel} selectedId={selectedId}
+                rightInset={propertiesOpen ? propertiesWidth : 0} canvasRef={canvasRef} onClose={() => setCameraToolsView(null)} />
+            )}</ModelFromStore>
           )}
           {showDrawing && open.kind === 'sheet' && openSheet && (
             <ModelFromStore store={modelStore}>
