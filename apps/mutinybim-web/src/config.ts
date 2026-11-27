@@ -18,6 +18,15 @@
  *                                 computer, allowed only when the public address is a loopback address)
  *   MUTINYBIM_WEB_SCRIPT_RUNNER   folder holding the runner's two built files (default /usr/local/lib/mutinybim/script-runner)
  *   MUTINYBIM_WEB_SCRIPT_RUNS     scripts running at once on this machine (default 2; each may use about 1.2 GB)
+ *   MUTINYBIM_WEB_SUPABASE_URL    optional Supabase project URL (e.g. https://<ref>.supabase.co); turns on Supabase Auth (email, Google, password reset emails)
+ *   MUTINYBIM_WEB_SUPABASE_PUBLISHABLE_KEY  Supabase publishable (or anon) key; required when MUTINYBIM_WEB_SUPABASE_URL is set
+ *   MUTINYBIM_WEB_SUPABASE_SECRET_KEY       optional Supabase secret (service_role) key; stores app records in Supabase Postgres instead of local SQLite
+ *   MUTINYBIM_WEB_SUPABASE_GOOGLE "0"/"false" hides "Continue with Google" when Supabase Auth is on (default on)
+ *   MUTINYBIM_WEB_TRUST_PROXY     "1"/"true" trusts Fly-Client-IP / X-Forwarded-For for rate limits (default on when FLY_APP_NAME is set)
+ *   MUTINYBIM_WEB_MAIL            "off" (default) or "smtp": the app's own email (password reset links)
+ *   MUTINYBIM_WEB_MAIL_URL        SMTP server, e.g. smtps://user:password@smtp.example.com:465 or smtp://…:587 (STARTTLS
+ *                                 is required unless the server is this computer); a secret, so set it as one
+ *   MUTINYBIM_WEB_MAIL_FROM       sender, e.g. "MutinyBIM <no-reply@app.example.com>"; required when mail is on
  *
  * Provider and quote settings are addresses and labels only. No secret is
  * read here: providers are public clients (authorization code with PKCE,
@@ -26,6 +35,17 @@
  * app keeps those passes under is read by linked-hosts.ts, not here.
  */
 import path from "node:path";
+
+export interface SupabaseConfig {
+  /** Project URL, e.g. https://<ref>.supabase.co (no trailing slash). */
+  readonly url: string;
+  /** Publishable (or anon) key used for Auth REST endpoints. */
+  readonly publishableKey: string;
+  /** Optional secret (service_role) key; when set, app metadata is kept in Supabase Postgres instead of SQLite. */
+  readonly secretKey?: string;
+  /** Show "Continue with Google" via Supabase Auth (default true). */
+  readonly google: boolean;
+}
 
 export interface OAuthProviderConfig {
   /** Short id used in addresses (`/auth/<id>/start`) and stored with each linked account. */
@@ -40,6 +60,8 @@ export interface OAuthProviderConfig {
   readonly scope?: string;
   /** The name shown on the provider's consent screen when the app registers itself. */
   readonly clientName?: string;
+  /** Optional email domains (e.g. ["example.com"]) that see a one-time opt-in prompt to link this provider after signing in another way. */
+  readonly domains?: readonly string[];
   /** The provider is also a linked host: it lists models people can open there and serves the open tools for them. */
   readonly models?: LinkedModelsConfig;
 }
@@ -84,6 +106,21 @@ export interface WebConfig {
   readonly secure: boolean;
   /** Where outside assistants' scripts run (absent: the sealed box with its defaults). */
   readonly scripts?: ScriptsConfig;
+  /** Optional Supabase Auth (+ optional Postgres metadata store). Absent: built-in email/password + SQLite. */
+  readonly supabase?: SupabaseConfig | null;
+  /** Trust reverse-proxy client IP headers (Fly-Client-IP / X-Forwarded-For) for sign-in rate limiting. */
+  readonly trustProxy?: boolean;
+  /** Outgoing mail (MUTINYBIM_WEB_MAIL). Absent or null: the app sends no email. */
+  readonly mail?: MailConfig | null;
+}
+
+/** The app's own outgoing mail. Absent: the app sends no email. */
+export interface MailConfig {
+  readonly kind: "smtp";
+  /** smtp:// or smtps:// address, credentials included. Never logged. */
+  readonly url: string;
+  /** The From header: an address, optionally with a display name. */
+  readonly from: string;
 }
 
 export interface ScriptsConfig {
@@ -163,9 +200,24 @@ export function parseProviders(raw: string | undefined): readonly OAuthProviderC
     const clientId = text(entry.clientId);
     const scope = text(entry.scope);
     const clientName = text(entry.clientName);
+    const domains = parseDomains(id, entry.domains);
     const models = parseLinkedModels(id, entry.models);
-    return { id, label, issuer: issuerUrl.toString().replace(/\/$/, ""), ...(clientId ? { clientId } : {}), ...(scope ? { scope } : {}), ...(clientName ? { clientName } : {}), ...(models ? { models } : {}) };
+    return { id, label, issuer: issuerUrl.toString().replace(/\/$/, ""), ...(clientId ? { clientId } : {}), ...(scope ? { scope } : {}), ...(clientName ? { clientName } : {}), ...(domains ? { domains } : {}), ...(models ? { models } : {}) };
   });
+}
+
+function parseDomains(id: string, value: unknown): readonly string[] | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!Array.isArray(value)) throw new Error(`[mutinybim-web] provider ${id}: domains must be an array of domain names`);
+  const out: string[] = [];
+  for (const item of value) {
+    const raw = text(item)?.toLowerCase().replace(/^@/, "");
+    if (!raw || !/^[a-z0-9.-]+\.[a-z]{2,}$/.test(raw)) {
+      throw new Error(`[mutinybim-web] provider ${id}: domains entry "${String(item)}" is not a valid domain`);
+    }
+    if (!out.includes(raw)) out.push(raw);
+  }
+  return out.length > 0 ? out : undefined;
 }
 
 export function parseQuote(raw: string | undefined): QuoteConfig | null {
@@ -180,6 +232,63 @@ export function parseQuote(raw: string | undefined): QuoteConfig | null {
   if (parsedUrl.protocol !== "https:" && parsedUrl.protocol !== "http:") throw new Error("[mutinybim-web] the quote url must be a web address");
   const blurb = text(parsed.blurb);
   return { label, provider, url: parsedUrl.toString(), ...(blurb ? { blurb } : {}) };
+}
+
+export function parseSupabase(env: NodeJS.ProcessEnv): SupabaseConfig | null {
+  const rawUrl = text(env.MUTINYBIM_WEB_SUPABASE_URL);
+  const publishableKey = text(env.MUTINYBIM_WEB_SUPABASE_PUBLISHABLE_KEY);
+  const secretKey = text(env.MUTINYBIM_WEB_SUPABASE_SECRET_KEY);
+  if (!rawUrl && !publishableKey && !secretKey) return null;
+  if (!rawUrl || !publishableKey) {
+    throw new Error("[mutinybim-web] MUTINYBIM_WEB_SUPABASE_URL and MUTINYBIM_WEB_SUPABASE_PUBLISHABLE_KEY must both be set when using Supabase");
+  }
+  const parsed = new URL(rawUrl);
+  if (parsed.protocol !== "https:" && !LOOPBACK.has(parsed.hostname) && !parsed.hostname.endsWith(".localhost")) {
+    throw new Error("[mutinybim-web] MUTINYBIM_WEB_SUPABASE_URL must be https (or this computer)");
+  }
+  const googleRaw = (env.MUTINYBIM_WEB_SUPABASE_GOOGLE ?? "1").trim().toLowerCase();
+  const google = googleRaw !== "0" && googleRaw !== "false" && googleRaw !== "off";
+  return {
+    url: parsed.toString().replace(/\/$/, ""),
+    publishableKey,
+    ...(secretKey ? { secretKey } : {}),
+    google,
+  };
+}
+
+const SENDER = /^(?:[^<>\r\n]*<[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+>|[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+)$/;
+
+/** Reads MUTINYBIM_WEB_MAIL*. Error messages name the setting, never its value: the URL carries a password. */
+export function parseMail(env: NodeJS.ProcessEnv): MailConfig | null {
+  const kind = (text(env.MUTINYBIM_WEB_MAIL) ?? "off").toLowerCase();
+  if (kind === "off") return null;
+  if (kind !== "smtp") throw new Error("[mutinybim-web] MUTINYBIM_WEB_MAIL must be off or smtp");
+  const url = text(env.MUTINYBIM_WEB_MAIL_URL);
+  const from = text(env.MUTINYBIM_WEB_MAIL_FROM);
+  if (!url || !from) throw new Error("[mutinybim-web] MUTINYBIM_WEB_MAIL=smtp needs MUTINYBIM_WEB_MAIL_URL and MUTINYBIM_WEB_MAIL_FROM");
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error("[mutinybim-web] MUTINYBIM_WEB_MAIL_URL is not an smtp:// or smtps:// address");
+  }
+  if ((parsed.protocol !== "smtp:" && parsed.protocol !== "smtps:") || !parsed.hostname) {
+    throw new Error("[mutinybim-web] MUTINYBIM_WEB_MAIL_URL is not an smtp:// or smtps:// address");
+  }
+  if (!SENDER.test(from)) throw new Error("[mutinybim-web] MUTINYBIM_WEB_MAIL_FROM must be one address, like \"MutinyBIM <no-reply@example.com>\"");
+  return { kind: "smtp", url, from };
+}
+
+/** The sender's domain, which the startup log may show. */
+export function senderDomain(mail: MailConfig): string {
+  return mail.from.match(/@([^\s>]+)>?$/)?.[1] ?? "?";
+}
+
+function parseTrustProxy(env: NodeJS.ProcessEnv): boolean {
+  const explicit = text(env.MUTINYBIM_WEB_TRUST_PROXY)?.toLowerCase();
+  if (explicit === "1" || explicit === "true" || explicit === "yes") return true;
+  if (explicit === "0" || explicit === "false" || explicit === "no") return false;
+  return Boolean(text(env.FLY_APP_NAME));
 }
 
 export function readConfig(env: NodeJS.ProcessEnv = process.env): WebConfig {
@@ -199,5 +308,8 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): WebConfig {
     quote: parseQuote(env.MUTINYBIM_WEB_QUOTE),
     secure: origin.startsWith("https://"),
     scripts: parseScripts(env, origin),
+    supabase: parseSupabase(env),
+    trustProxy: parseTrustProxy(env),
+    mail: parseMail(env),
   };
 }

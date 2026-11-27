@@ -9,7 +9,7 @@
 import type { PackManifest } from "../contract";
 import { PACK_CONTRACT_VERSION } from "../version";
 
-export type FirstPartyPackId = "electrical" | "plumbing_gas" | "mechanical" | "fire_protection" | "architecture" | "struct";
+export type FirstPartyPackId = "electrical" | "plumbing_gas" | "mechanical" | "fire_protection" | "architecture" | "struct" | "civil";
 
 const KERNEL_RANGE = `^${PACK_CONTRACT_VERSION}`;
 
@@ -28,8 +28,11 @@ export const ARCHITECTURE_MANIFEST: PackManifest = { id: "architecture", name: "
 /** Round 14: Structural, always installed (it was a Preview add-on a model switched on). Id and version unchanged, so its classes, rows and stored switches keep theirs. */
 export const STRUCTURAL_MANIFEST: PackManifest = { id: "struct", name: "Structural", version: "0.1.0", kernel: KERNEL_RANGE, firstParty: true, description: "Steel beams, columns and pad footings, a wide-flange catalogue, live load by use, tributary areas and the gravity load path to the footings. One service-level load case." };
 
+/** Civil, always installed alongside the other first-party trades. Id and version unchanged, so its classes, rows and stored switches keep theirs. */
+export const CIVIL_MANIFEST: PackManifest = { id: "civil", name: "Civil", version: "0.1.0", kernel: KERNEL_RANGE, firstParty: true, description: "Storm catchments, inlets, manholes, outfalls and alignments; rational-method runoff on a gravity network; existing and proposed TIN surfaces from LandXML with prismoidal cut and fill." };
+
 /** In the order Settings lists them, which is also the order their rows join every point. */
-export const FIRST_PARTY_MANIFESTS: readonly PackManifest[] = [ELECTRICAL_MANIFEST, PLUMBING_GAS_MANIFEST, MECHANICAL_MANIFEST, FIRE_PROTECTION_MANIFEST, ARCHITECTURE_MANIFEST, STRUCTURAL_MANIFEST];
+export const FIRST_PARTY_MANIFESTS: readonly PackManifest[] = [ELECTRICAL_MANIFEST, PLUMBING_GAS_MANIFEST, MECHANICAL_MANIFEST, FIRE_PROTECTION_MANIFEST, ARCHITECTURE_MANIFEST, STRUCTURAL_MANIFEST, CIVIL_MANIFEST];
 
 /** The reserved first-party ids: only a `firstParty` pack with one of these may contribute bare ids. */
 export const FIRST_PARTY_PACK_IDS: readonly string[] = FIRST_PARTY_MANIFESTS.map((m) => m.id);
@@ -61,12 +64,12 @@ const STORED_OWNERS: Readonly<Record<StoredNameKind, ReadonlyMap<string, FirstPa
   /** Kernel commands whose case for a kind a first-party add-on owns (`PackCommandDef.claims`): refused naming it when it isn't loaded. */
   claim: new Map([["slide_branch", M], ["resize_run", M], ["move_equipment", M]]),
   diagram: new Map([["one_line", E], ["electrical_riser", E], ["controls_diagram", E], ["plumbing_riser", P], ["plumbing_isometric", P], ["air_schematic", M]]),
-  form: new Map([["panel", E], ["switchboard", E], ["feeder", E], ["connection_types", E], ["equipment_connections", E], ["lighting_controls", E], ["gas_equipment", P], ["gas_connections", P]]),
+  form: new Map([["panel", E], ["switchboard", E], ["feeder", E], ["connection_types", E], ["equipment_connections", E], ["lighting_controls", E], ["photometric_summary", E], ["egress_lighting_compliance", E], ["gas_equipment", P], ["gas_connections", P]]),
   table: new Map([["ventilation", M], ["pressurization", M], ["gas", P]]),
   /** Built-in pipe materials whose products (sizes, joints) a first-party add-on supplies. */
   pipe_material: new Map(["copper", "pex", "cpvc", "cast_iron", "pvc", "abs", "steel", "black_steel", "galvanized", "pp_r", "csst", "pe"].map((m) => [m, P])),
   /** Stored catalog record types (`CATALOG_ENTRY_POINT`) a first-party add-on registers (round 12, E12). */
-  catalog: new Map([["feeder_type", E], ["circuit_template", E], ["pipe_type", P], ["plumbing_settings", P]]),
+  catalog: new Map([["feeder_type", E], ["circuit_template", E], ["photometric_profile", E], ["pipe_type", P], ["plumbing_settings", P]]),
   /** Stored fitting family ids by their first word (`pipe.…`): the kernel draws no pipe family of its own (round 12). */
   fitting_family: new Map([["pipe", P]]),
 };

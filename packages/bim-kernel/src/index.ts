@@ -111,6 +111,7 @@ export * from "./annotation/detail-lines";
 export * from "./annotation/drafting-migrations";
 export * from "./schema-version";
 export * from "./annotation/detail-snaps";
+export * from "./drawing/detail-check";
 export { NOTE_FONT_FACES, NOTE_FONT_FILES } from "./annotation/font-metrics.generated";
 export * from "./organization/model";
 export * from "./organization/rules";
@@ -135,6 +136,7 @@ export * from "./part-model/clearance";
 export * from "./spatial";
 export * from "./commands/spatial";
 export * from "./annotation/callouts";
+export * from "./drawing/polygon-clip";
 export * from "./annotation/figures";
 export * from "./organization/typicals";
 export * from "./propose";
@@ -179,7 +181,7 @@ export type { Perimeter } from "./propose/perimeter";
 export * from "./catalog/entry-point";
 export * from "./layout/diagram-layout-point";
 export * from "./layout/view-graphics-point";
-export { PartLabelIndex, drawPartSymbol, partPlanOutline, type DrawPartSymbolOptions, type FillFn, type PartLabelBox, type PartLabelStore, type PlanOutline } from "./drawing/runs";
+export { PartLabelIndex, drawPartClearancesBatch, drawPartSymbol, partPlanOutline, type BatchedClearanceZone, type DrawPartSymbolOptions, type FillFn, type PartLabelBox, type PartLabelStore, type PlanOutline } from "./drawing/runs";
 export type * from "./connections/faces";
 export type * from "./registry/kind-row-faces";
 export { kindRowFaceProblems } from "./registry/kind-row-faces";
@@ -243,3 +245,6 @@ export { lineEndCommandSchemas, isLineEndCommand, type LineEndCommand } from "./
 export { joinedEndFollowers, carryJoinedEndsOfReshape } from "./joins/carry";
 // Shared material definitions (`kernel.material` v1): 2D plan/section poché and 3D appearance.
 export * from "./materials";
+// Sheet review markups: non-printing felt-tip marker & highlighter ink on sheets (`documents:sheet_markups`).
+export * from "./annotation/markups";
+export * from "./annotation/markup-commands";

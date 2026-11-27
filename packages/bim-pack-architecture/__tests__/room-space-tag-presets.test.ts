@@ -9,7 +9,6 @@
  * Fails without the change: `general.room_area` and `general.space_name` are
  * not registered, so `tagStylePreset` returns null.
  */
-import { ARCHITECTURE_PACK } from "@permitzip/bim-pack-architecture";
 import {
   DEFAULT_SETTINGS,
   asElementId,
@@ -22,8 +21,9 @@ import {
   type ModelState,
   type Room,
   withUpgradePolicy,
-} from "../src";
-import { PackSet, withPackSet } from "../src/packs";
+} from "@permitzip/bim-kernel";
+import { PackSet, withPackSet } from "@permitzip/bim-kernel/packs";
+import { ARCHITECTURE_PACK } from "../src";
 
 const FT = 304.8;
 const rect = (x0: number, y0: number, w: number, h: number) => [

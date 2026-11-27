@@ -5,12 +5,15 @@
  * every form says what went wrong in words.
  */
 import type { ComponentProps, ReactNode } from "react";
+import { randomUUID } from "node:crypto";
 import { Badge, Button, buttonVariants, Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle, cn, Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle, Field, FieldHint, Input, Label, NativeSelect, Separator } from "@permitzip/bim-ui";
 import type { OAuthProviderConfig, QuoteConfig, WebConfig } from "./config";
 import { approvalTitle, type PendingApproval } from "./assistant-approvals";
-import type { AgentKeyRow, AssistantGrantRow, LinkedModelRow, ModelRow, SharedModelRow, ShareRow, UserRow } from "./db";
+import type { AgentKeyRow, AssistantGrantRow, LinkedModelRow, ModelCreation, ModelRow, SharedModelRow, ShareRow, UserRow } from "./db";
 import type { LinkedProvider, LinkedView } from "./linked-hosts";
 import type { ModelSummary } from "./models";
+import { INVITATION_DAYS, type Invitation, type InvitationCard } from "./model-invitations";
+import type { Transfer } from "./model-transfers";
 import { formatWhen, page, waitingApprovalsOf, type Flash, type FrameUser } from "./ui";
 
 function frameUser(user: UserRow): FrameUser {
@@ -30,23 +33,59 @@ function PageTitle({ children, lede }: { children: ReactNode; lede?: ReactNode }
   );
 }
 
-function ProviderButtons({ providers, returnTo }: { providers: readonly OAuthProviderConfig[]; returnTo: string }) {
-  if (providers.length === 0) return null;
+function GoogleMark() {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4 shrink-0" fill="currentColor">
+      <path d="M21.35 11.1h-9.18v2.98h5.27c-.23 1.24-.92 2.29-1.97 2.99v2.48h3.19c1.86-1.72 2.94-4.25 2.94-7.24 0-.42-.04-.83-.11-1.21h-.14Z" />
+      <path d="M12.17 22c2.66 0 4.89-.88 6.52-2.38l-3.19-2.48c-.88.59-2.01.94-3.33.94-2.56 0-4.73-1.73-5.51-4.05H3.37v2.55A9.83 9.83 0 0 0 12.17 22Z" />
+      <path d="M6.66 14.03a5.9 5.9 0 0 1 0-3.79V7.69H3.37a9.83 9.83 0 0 0 0 8.89l3.29-2.55Z" />
+      <path d="M12.17 5.92c1.45 0 2.74.5 3.76 1.48l2.82-2.82C17.05 2.99 14.82 2 12.17 2a9.83 9.83 0 0 0-8.8 5.69l3.29 2.55c.78-2.32 2.95-4.05 5.51-4.32Z" />
+    </svg>
+  );
+}
+
+function GoogleAuthButton({ config, returnTo }: { config: WebConfig; returnTo: string }) {
+  if (!config.supabase?.google) return null;
   return (
     <>
-      <div className="flex flex-col gap-2">
-        {providers.map((p) => (
-          <Button key={p.id} asChild size="lg" variant="outline" className="w-full">
-            <a href={`/auth/${p.id}/start?return_to=${encodeURIComponent(returnTo)}`}>{p.label}</a>
-          </Button>
-        ))}
-      </div>
+      <Button asChild size="lg" variant="outline" className="w-full">
+        <a href={`/auth/supabase/google/start?return_to=${encodeURIComponent(returnTo)}`}>
+          <GoogleMark />
+          Continue with Google
+        </a>
+      </Button>
       <div className="flex items-center gap-3 text-xs text-(--mutiny-muted)">
         <Separator className="flex-1" />
         or with email
         <Separator className="flex-1" />
       </div>
     </>
+  );
+}
+
+function OrgProviderButtons({ providers, returnTo, mode }: { providers: readonly OAuthProviderConfig[]; returnTo: string; mode: "login" | "signup" }) {
+  if (providers.length === 0) return null;
+  const heading = mode === "signup" ? "Already have an organization account?" : "or with an organization";
+  const hint =
+    mode === "signup"
+      ? "Only for existing accounts on that platform — use the form above to create a free MutinyBIM account."
+      : "For existing organization accounts only (not for new public sign-ups).";
+  return (
+    <div className="flex flex-col gap-2 pt-1">
+      <div className="flex items-center gap-3 text-xs text-(--mutiny-muted)">
+        <Separator className="flex-1" />
+        {heading}
+        <Separator className="flex-1" />
+      </div>
+      <p className="text-xs text-(--mutiny-muted)">{hint}</p>
+      <div className="flex flex-col gap-2">
+        {providers.map((p) => (
+          <Button key={p.id} asChild size="default" variant="outline" className="w-full">
+            <a href={`/auth/${p.id}/start?return_to=${encodeURIComponent(returnTo)}`}>{p.label}</a>
+          </Button>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -114,7 +153,7 @@ export function loginPage(config: WebConfig, options: { email?: string; returnTo
         <CardDescription>Open your models and the ones shared with you.</CardDescription>
       </CardHeader>
       <CardContent>
-        <ProviderButtons providers={config.providers} returnTo={options.returnTo} />
+        <GoogleAuthButton config={config} returnTo={options.returnTo} />
         <form method="post" action="/login" className="flex flex-col gap-3">
           <input type="hidden" name="return_to" value={options.returnTo} />
           <TextField label="Email" name="email" type="email" autoComplete="email" required defaultValue={options.email ?? ""} />
@@ -123,6 +162,7 @@ export function loginPage(config: WebConfig, options: { email?: string; returnTo
             Log in
           </Button>
         </form>
+        <OrgProviderButtons providers={config.providers} returnTo={options.returnTo} mode="login" />
       </CardContent>
       <CardFooter className="justify-between text-sm text-(--mutiny-muted)">
         <a href="/forgot">Forgot your password?</a>
@@ -157,7 +197,7 @@ export function signupPage(config: WebConfig, options: { email?: string; name?: 
         <CardDescription>Free models, shared with whoever you choose.</CardDescription>
       </CardHeader>
       <CardContent>
-        <ProviderButtons providers={config.providers} returnTo="/models" />
+        <GoogleAuthButton config={config} returnTo="/models" />
         <form method="post" action="/signup" className="flex flex-col gap-3">
           <TextField label="Your name" hint="People editing with you see it." name="name" autoComplete="name" required maxLength={80} defaultValue={options.name ?? ""} />
           <TextField label="Email" name="email" type="email" autoComplete="email" required defaultValue={options.email ?? ""} />
@@ -172,6 +212,7 @@ export function signupPage(config: WebConfig, options: { email?: string; name?: 
             Create account
           </Button>
         </form>
+        <OrgProviderButtons providers={config.providers} returnTo="/models" mode="signup" />
       </CardContent>
       <CardFooter className="text-sm text-(--mutiny-muted)">
         Already have one?&nbsp;<a href="/login">Log in</a>
@@ -228,8 +269,37 @@ export function privacyPage(): string {
   ]);
 }
 
-/** No email is sent by this app, so recovery is a linked sign-in or a reset link from whoever runs the server. */
-export function forgotPage(config: WebConfig): string {
+/** Password recovery: sends a reset email through Supabase Auth or the app's own mail, otherwise explains local recovery. */
+export function forgotPage(config: WebConfig, options: { email?: string; flash?: Flash; mail?: boolean } = {}): string {
+  if (config.supabase || options.mail) {
+    return page(
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-2xl">Reset your password</CardTitle>
+          <CardDescription>Enter the email address on your account and we'll send a one-time reset link.</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <form method="post" action="/forgot" className="flex flex-col gap-3">
+            <TextField label="Email" name="email" type="email" autoComplete="email" required defaultValue={options.email ?? ""} />
+            <Button type="submit" size="lg">
+              Send reset link
+            </Button>
+          </form>
+          {config.supabase?.google ? (
+            <p className="text-xs text-(--mutiny-muted)">
+              Signed up with Google? You don't need a password — use <strong>Continue with Google</strong> on the log-in page.
+            </p>
+          ) : null}
+        </CardContent>
+        <CardFooter>
+          <Button asChild variant="ghost">
+            <a href="/login">Back to log in</a>
+          </Button>
+        </CardFooter>
+      </Card>,
+      { title: "Forgot your password", user: null, quote: null, flash: options.flash ?? null, narrow: true },
+    );
+  }
   return page(
     <Card>
       <CardHeader>
@@ -259,7 +329,135 @@ export function forgotPage(config: WebConfig): string {
         </Button>
       </CardFooter>
     </Card>,
-    { title: "Forgot your password", user: null, quote: null, narrow: true },
+    { title: "Forgot your password", user: null, quote: null, flash: options.flash ?? null, narrow: true },
+  );
+}
+
+/** What an invitation link shows the signed-in account. Nothing about the invitation shows unless the address matches and is confirmed. */
+export function invitationPage(user: UserRow, view: { readonly state: "open"; readonly card: InvitationCard } | { readonly state: "unconfirmed"; readonly mail: boolean } | { readonly state: "unavailable" }): string {
+  const frame = { title: "Invitation", user: frameUser(user), quote: null, flash: null, narrow: true };
+  if (view.state === "unavailable") {
+    return page(
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-2xl">This invitation doesn't work here</CardTitle>
+          <CardDescription>
+            It may be for a different address, cancelled, replaced by a newer invitation, already answered or expired. You're logged in as {user.email}. If it was meant for you, ask the model's owner to invite this address again.
+          </CardDescription>
+        </CardHeader>
+        <CardFooter>
+          <Button asChild><a href="/models">My models</a></Button>
+        </CardFooter>
+      </Card>,
+      frame,
+    );
+  }
+  if (view.state === "unconfirmed") {
+    return page(
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-2xl">Confirm your email first</CardTitle>
+          <CardDescription>
+            {view.mail
+              ? `Invitations open for a confirmed address. In Settings, send a confirmation link to ${user.email}, open it, then open this invitation again.`
+              : `Invitations open for a confirmed address, and ${user.email} isn't confirmed yet. This server sends no email, so ask whoever runs this server to confirm it, or link a sign-in provider that vouches for it in Settings.`}
+          </CardDescription>
+        </CardHeader>
+        <CardFooter>
+          <Button asChild><a href="/settings">Go to Settings</a></Button>
+        </CardFooter>
+      </Card>,
+      frame,
+    );
+  }
+  const { card } = view;
+  return page(
+    <Card data-testid="invitation">
+      <CardHeader>
+        <CardTitle className="text-2xl">Join “{card.model_name}”?</CardTitle>
+        <CardDescription>
+          {card.inviter_name} invited {card.email} to {card.role === "edit" ? "edit" : "view"} this model. The invitation expires {formatWhen(card.expires_at)}.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="flex gap-2">
+        <form method="post" action={`/invitations/${card.id}/accept`}>
+          <Button type="submit" size="lg">Accept invitation</Button>
+        </form>
+        <form method="post" action={`/invitations/${card.id}/decline`}>
+          <Button type="submit" size="lg" variant="outline">Decline</Button>
+        </form>
+      </CardContent>
+    </Card>,
+    frame,
+  );
+}
+
+/** Confirms the signed-in account's address from a mailed link, with one button so nothing changes on a plain visit. */
+export function confirmEmailPage(user: UserRow, options: { token: string; refused?: boolean }): string {
+  const email = user.email;
+  const confirmed = Boolean(user.email_confirmed_at);
+  if (options.refused) {
+    return page(
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-2xl">That confirmation link doesn't work here</CardTitle>
+          <CardDescription>
+            It may be for a different account, already used, more than a day old, or sent to an earlier address. You're logged in as {email}. Send a new link from Settings.
+          </CardDescription>
+        </CardHeader>
+        <CardFooter>
+          <Button asChild>
+            <a href="/settings">Go to Settings</a>
+          </Button>
+        </CardFooter>
+      </Card>,
+      { title: "Confirm your email", user: frameUser(user), quote: null, flash: null, narrow: true },
+    );
+  }
+  return page(
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-2xl">Confirm your email</CardTitle>
+        <CardDescription>
+          {confirmed ? `${email} is already confirmed.` : `Confirm ${email} for the account you're logged in to.`}
+        </CardDescription>
+      </CardHeader>
+      {confirmed ? null : (
+        <CardContent>
+          <form method="post" action={`/confirm/${encodeURIComponent(options.token)}`} className="flex flex-col gap-3">
+            <Button type="submit" size="lg">
+              Confirm {email}
+            </Button>
+          </form>
+        </CardContent>
+      )}
+      <CardFooter>
+        <Button asChild variant="ghost">
+          <a href="/settings">Back to Settings</a>
+        </Button>
+      </CardFooter>
+    </Card>,
+    { title: "Confirm your email", user: frameUser(user), quote: null, flash: null, narrow: true },
+  );
+}
+
+export function supabaseResetPage(options: { email: string; flash?: Flash }): string {
+  return page(
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-2xl">Set a new password</CardTitle>
+        <CardDescription>For {options.email}. You are signed out everywhere else once it is saved.</CardDescription>
+      </CardHeader>
+      <CardContent>
+        <form method="post" action="/reset-password" className="flex flex-col gap-3">
+          <TextField label="New password" hint="At least 8 characters." name="password" type="password" autoComplete="new-password" required minLength={8} />
+          <Button type="submit" size="lg">
+            Save and log in
+          </Button>
+        </form>
+      </CardContent>
+    </Card>,
+    { title: "Reset your password", user: null, quote: null, flash: options.flash ?? null, narrow: true },
   );
 }
 
@@ -355,6 +553,8 @@ export interface LinkedModelsView {
   readonly sections: readonly LinkedView[];
   /** A provider is a linked host but the server has no link key (shown to people who use that provider). */
   readonly keyMissing: readonly OAuthProviderConfig[];
+  /** Organization providers whose configured email domain matches the signed-in user and are not yet linked or dismissed. */
+  readonly linkPrompts?: readonly OAuthProviderConfig[];
 }
 
 function LinkedRow({ row, host }: { row: LinkedModelRow; host: string }) {
@@ -422,11 +622,74 @@ function LinkedSection({ view }: { view: LinkedView }) {
   );
 }
 
-export function modelsPage(config: WebConfig, user: UserRow, models: readonly ModelRow[], shared: readonly SharedModelRow[], flash?: Flash, linked: LinkedModelsView = { sections: [], keyMissing: [] }): string {
-  const atLimit = models.length >= config.modelLimit;
+export function modelsPage(config: WebConfig, user: UserRow, models: readonly ModelRow[], shared: readonly SharedModelRow[], flash?: Flash, linked: LinkedModelsView = { sections: [], keyMissing: [] }, pending: readonly ModelCreation[] = [], inbox: readonly Transfer[] = [], invitations: readonly InvitationCard[] = []): string {
+  const atLimit = models.length + pending.length >= config.modelLimit;
   return page(
     <>
       <PageTitle>My models</PageTitle>
+      {invitations.map((invite) => (
+        <Card key={invite.id} data-testid="invitation">
+          <CardHeader>
+            <CardTitle>Join “{invite.model_name}”?</CardTitle>
+            <CardDescription>
+              {invite.inviter_name} invited {invite.email} to {invite.role === "edit" ? "edit" : "view"} this model. Nothing is shared until you accept. The invitation expires {formatWhen(invite.expires_at)}.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="flex gap-2">
+            <form method="post" action={`/invitations/${invite.id}/accept`}>
+              <Button type="submit">Accept invitation</Button>
+            </form>
+            <form method="post" action={`/invitations/${invite.id}/decline`}>
+              <Button type="submit" variant="outline">Decline</Button>
+            </form>
+          </CardContent>
+        </Card>
+      ))}
+      {inbox.map((offer) => (
+        <Card key={offer.id}>
+          <CardHeader>
+            <CardTitle>Take ownership of {offer.model_name}?</CardTitle>
+            <CardDescription>{offer.sender_name} offered you this model.{" "}
+              {atLimit ? "Your model slots are full. Free one to accept this offer." : "Accepting uses one of your model slots."}
+              {" "}{offer.retained === "none" ? "The sender gives up their personal access." : `The sender keeps ${offer.retained} access.`}
+              {" "}The offer expires {formatWhen(offer.expires_at)}.</CardDescription>
+          </CardHeader>
+          <CardContent className="flex gap-2">
+            <ConfirmForm action={`/transfers/${offer.id}/accept`} question={`Take ownership of “${offer.model_name}”?`}>
+              <Button type="submit">Accept transfer</Button>
+            </ConfirmForm>
+            <form method="post" action={`/transfers/${offer.id}/decline`}>
+              <Button type="submit" variant="outline">Decline</Button>
+            </form>
+          </CardContent>
+        </Card>
+      ))}
+      {(linked.linkPrompts ?? []).map((p) => {
+        const host = providerName(p);
+        const domain = user.email.split("@")[1] ?? "";
+        return (
+          <Card key={p.id} data-testid={`link-prompt-${p.id}`}>
+            <CardContent className="flex flex-wrap items-center gap-3 pt-4">
+              <div className="min-w-0 flex-1">
+                <p className="font-semibold">Link your {host} account?</p>
+                <p className="text-sm text-(--mutiny-muted)">
+                  You signed in with an <code>@{domain}</code> email. Link {host} to log in either way{p.models ? ` and reach your ${p.models.label} here` : ""}.
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button asChild size="sm">
+                  <a href={`/auth/${p.id}/start?link=1&return_to=%2Fmodels`}>Link {host}</a>
+                </Button>
+                <form method="post" action={`/auth/${p.id}/link-prompt/dismiss`}>
+                  <Button type="submit" size="sm" variant="ghost">
+                    Not now
+                  </Button>
+                </form>
+              </div>
+            </CardContent>
+          </Card>
+        );
+      })}
       <Card>
         <CardHeader>
           <CardTitle>Yours</CardTitle>
@@ -436,7 +699,7 @@ export function modelsPage(config: WebConfig, user: UserRow, models: readonly Mo
         </CardHeader>
         <CardContent>
           {models.length === 0 ? (
-            <ModelEmpty title="No models yet">Make your first one below. Start blank (one level), or from the sample mechanical model to look around first.</ModelEmpty>
+            <ModelEmpty title="No models yet">Make your first one below. Start blank (one level), or from the sample building showcase (two-story creative studio with architecture, structural steel & foundations, HVAC, electrical, plumbing, live diagrams, schedules and a 19-sheet Arch D set).</ModelEmpty>
           ) : (
             <ul className="flex flex-col gap-2" data-testid="own-models">
               {models.map((m) => (
@@ -461,7 +724,7 @@ export function modelsPage(config: WebConfig, user: UserRow, models: readonly Mo
                       {m.name}
                     </a>
                     <span className="text-xs text-(--mutiny-muted)">
-                      {m.owner_name}'s · changed {formatWhen(m.updated_at)}
+                      {m.owner_name}'s{m.team_names.length > 0 && ` · via ${m.team_names.join(", ")}`} · changed {formatWhen(m.updated_at)}
                     </span>
                   </div>
                   <Badge variant={m.role === "edit" ? "default" : "secondary"}>{m.role === "edit" ? "Can edit" : "View only"}</Badge>
@@ -482,9 +745,26 @@ export function modelsPage(config: WebConfig, user: UserRow, models: readonly Mo
           <CardDescription>Projects from {providerName(p)} can't be shown on this server yet: its operator hasn't set the key it keeps those connections under. Your own models are fine.</CardDescription>
         </Card>
       ))}
+      {pending.map((request) => (
+        <Card key={request.model_id}>
+          <CardHeader><CardTitle>Creating {request.name}</CardTitle></CardHeader>
+          <CardContent className="flex flex-wrap gap-2">
+            <form method="post" action="/models">
+              <input type="hidden" name="creation_key" value={request.creation_key} />
+              <input type="hidden" name="name" value={request.name} />
+              <input type="hidden" name="start" value={request.starter} />
+              <Button type="submit" size="sm">Resume creation</Button>
+            </form>
+            <form method="post" action="/models/creations/cancel">
+              <input type="hidden" name="creation_key" value={request.creation_key} />
+              <Button type="submit" size="sm" variant="outline">Cancel creation</Button>
+            </form>
+          </CardContent>
+        </Card>
+      ))}
       {atLimit ? (
         <Card>
-          <CardDescription>You have {models.length} models, the most one free account can keep. Delete one to make another.</CardDescription>
+          <CardDescription>{pending.length ? "Pending creations reserve model slots. Cancelling a pending creation frees its slot." : "All your model slots are in use. Delete a model to make room for another."}</CardDescription>
         </Card>
       ) : (
         <Card>
@@ -492,6 +772,7 @@ export function modelsPage(config: WebConfig, user: UserRow, models: readonly Mo
             <CardTitle>New model</CardTitle>
           </CardHeader>
           <form method="post" action="/models" className="flex flex-col gap-4">
+            <input type="hidden" name="creation_key" value={randomUUID()} />
             <TextField label="Name" name="name" required maxLength={120} placeholder="Sample Warehouse" />
             <fieldset className="flex flex-col gap-2">
               <legend className="mb-1 text-sm font-medium">Start from</legend>
@@ -499,7 +780,7 @@ export function modelsPage(config: WebConfig, user: UserRow, models: readonly Mo
                 <input type="radio" name="start" value="blank" defaultChecked className="accent-(--mutiny-selection)" /> A blank model with one level
               </label>
               <label className="flex items-center gap-2 text-sm">
-                <input type="radio" name="start" value="sample" className="accent-(--mutiny-selection)" /> The sample mechanical model (an air handler with ducts and diffusers)
+                <input type="radio" name="start" value="sample" className="accent-(--mutiny-selection)" /> The sample building showcase (two-story creative studio with architecture, structural steel & foundations, MEP systems, live diagrams, schedules and 19 Arch D sheets)
               </label>
             </fieldset>
             <div>
@@ -515,13 +796,42 @@ export function modelsPage(config: WebConfig, user: UserRow, models: readonly Mo
   );
 }
 
-export function sharePage(config: WebConfig, user: UserRow, model: ModelRow, shares: readonly ShareRow[], options: { email?: string; flash?: Flash } = {}): string {
+export interface ShareOptions {
+  readonly email?: string;
+  readonly flash?: Flash;
+  readonly offer?: Transfer | null;
+  readonly invitations?: readonly Invitation[];
+  /** Whether this server emails invitations. Without mail, the owner copies each link. */
+  readonly mail?: boolean;
+  /** A link to copy, shown once right after an invitation is saved with mail off. */
+  readonly link?: { readonly email: string; readonly url: string };
+}
+
+export function sharePage(config: WebConfig, user: UserRow, model: ModelRow, shares: readonly ShareRow[], options: ShareOptions = {}): string {
+  const invitations = options.invitations ?? [];
+  const now = new Date().toISOString();
   return page(
     <>
-      <PageTitle lede="People you share with see it under “Shared with you” on their My models page. They need a MutinyBIM account on this server; this app sends no email, so tell them yourself.">Share “{model.name}”</PageTitle>
+      <PageTitle lede={`Invite people by email. They accept from their My models page, signed in with that address once it's confirmed, and then see the model under “Shared with you”. ${options.mail ? "This server emails each invitation." : "This server sends no email, so you send each invitation's link yourself."}`}>Share “{model.name}”</PageTitle>
+      {options.link ? (
+        <Card data-testid="invitation-link">
+          <CardHeader>
+            <CardTitle>Send this link to {options.link.email}</CardTitle>
+            <CardDescription>
+              It's shown only this once. It works for {INVITATION_DAYS} days, and only for an account whose confirmed address is {options.link.email}, so sending it to someone else shares nothing.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Field>
+              <Label htmlFor="invitation-url">Invitation link</Label>
+              <Input id="invitation-url" readOnly value={options.link.url} className="font-mono text-sm" />
+            </Field>
+          </CardContent>
+        </Card>
+      ) : null}
       <Card>
         <CardHeader>
-          <CardTitle>Who has it</CardTitle>
+          <CardTitle>Owner and personal shares</CardTitle>
         </CardHeader>
         <CardContent>
           <ul className="flex flex-col gap-2" data-testid="shares">
@@ -536,8 +846,8 @@ export function sharePage(config: WebConfig, user: UserRow, model: ModelRow, sha
                 <span className="min-w-0 flex-1">
                   <strong>{s.display_name}</strong> <span className="text-(--mutiny-muted)">({s.email})</span>
                 </span>
-                <form method="post" action={`/models/${model.id}/share`} className="flex items-center gap-1.5">
-                  <input type="hidden" name="email" value={s.email} />
+                <form method="post" action={`/models/${model.id}/share/${s.user_id}/role`} className="flex items-center gap-1.5">
+                  <input type="hidden" name="grant_id" value={s.grant_id} />
                   <NativeSelect name="role" defaultValue={s.role} aria-label={`What ${s.display_name} can do`} className="h-8 w-auto">
                     <option value="view">View only</option>
                     <option value="edit">Can edit</option>
@@ -546,7 +856,10 @@ export function sharePage(config: WebConfig, user: UserRow, model: ModelRow, sha
                     Change
                   </Button>
                 </form>
-                <ConfirmForm action={`/models/${model.id}/share/${s.user_id}/delete`} question={`Stop sharing “${model.name}” with ${s.display_name}? They are disconnected at once.`}>
+                <ConfirmForm action={`/models/${model.id}/share/${s.user_id}/delete`}
+                  question={`Stop sharing “${model.name}” directly with ${s.display_name}? ` + (options.offer?.recipient_id === s.user_id
+                    ? "This ends their ownership offer. Any team access still applies."
+                    : "Any team access still applies.")}>
                   <Button type="submit" size="sm" variant="ghost" className="text-(--mutiny-danger)">
                     Remove
                   </Button>
@@ -554,17 +867,44 @@ export function sharePage(config: WebConfig, user: UserRow, model: ModelRow, sha
               </li>
             ))}
           </ul>
-          {shares.length === 0 ? <p className="text-(--mutiny-muted)">Only you have this model so far.</p> : null}
+          {shares.length === 0 ? <p className="text-(--mutiny-muted)">No personal shares yet.</p> : null}
         </CardContent>
       </Card>
       <Card>
         <CardHeader>
-          <CardTitle>Add someone</CardTitle>
-          <CardDescription>“Can edit” lets them change the model, make branches and save versions. “View only” lets them look and nothing else.</CardDescription>
+          <CardTitle>Invitations</CardTitle>
+          <CardDescription>Waiting for an answer. A new invitation to the same address replaces the old one.</CardDescription>
+        </CardHeader>
+        <CardContent>
+          {invitations.length > 0 ? <ul className="flex flex-col gap-2" data-testid="invitations">
+            {invitations.map((invite) => {
+              const expired = invite.expires_at <= now;
+              return (
+                <li key={invite.id} className="flex flex-wrap items-center gap-3 rounded-(--mutiny-radius) border border-(--mutiny-border) bg-(--mutiny-field) px-3 py-2">
+                  <span className="min-w-0 flex-1">
+                    <strong>{invite.email}</strong>{" "}
+                    <span className="text-(--mutiny-muted)">{expired ? "expired" : `expires ${formatWhen(invite.expires_at)}`}</span>
+                  </span>
+                  <Badge variant={expired ? "outline" : "secondary"}>{expired ? "Expired" : invite.role === "edit" ? "Can edit" : "View only"}</Badge>
+                  <form method="post" action={`/models/${model.id}/invitations/${invite.id}/cancel`}>
+                    <Button type="submit" size="sm" variant="ghost" className="text-(--mutiny-danger)">
+                      {expired ? "Remove" : "Cancel"}
+                    </Button>
+                  </form>
+                </li>
+              );
+            })}
+          </ul> : <p className="text-(--mutiny-muted)">No invitations waiting.</p>}
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader>
+          <CardTitle>Invite someone</CardTitle>
+          <CardDescription>“Can edit” lets them change the model, make branches and save versions. A personal “View only” share can coexist with edit access through a team.</CardDescription>
         </CardHeader>
         <form method="post" action={`/models/${model.id}/share`} className="flex flex-wrap items-end gap-2">
           <Field className="min-w-60 flex-1">
-            <Label htmlFor="share-email">Their account email</Label>
+            <Label htmlFor="share-email">Their email</Label>
             <Input id="share-email" name="email" type="email" required defaultValue={options.email ?? ""} placeholder="colleague@example.com" />
           </Field>
           <Field>
@@ -575,10 +915,44 @@ export function sharePage(config: WebConfig, user: UserRow, model: ModelRow, sha
             </NativeSelect>
           </Field>
           <Button type="submit" size="lg">
-            Share
+            Invite
           </Button>
         </form>
       </Card>
+      {options.offer ? (
+        <Card>
+          <CardHeader>
+            <CardTitle>Ownership offered to {options.offer.recipient_name}</CardTitle>
+            <CardDescription>You own this model until they accept. The offer expires {formatWhen(options.offer.expires_at)}.</CardDescription>
+          </CardHeader>
+          <CardContent><form method="post" action={`/transfers/${options.offer.id}/cancel`}>
+            <Button type="submit" variant="outline">Cancel offer</Button>
+          </form></CardContent>
+        </Card>
+      ) : shares.length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Transfer ownership</CardTitle>
+            <CardDescription>The model and its history stay together. The recipient must accept.</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <ConfirmForm action={`/models/${model.id}/transfer`} question={`Send an ownership offer for “${model.name}”?`} className="flex flex-col gap-3">
+              <Field><Label htmlFor="transfer-recipient">New owner</Label>
+                <NativeSelect name="recipient" id="transfer-recipient" data-confirm-label="New owner" required defaultValue="">
+                  <option value="" disabled>Choose someone with a share</option>
+                  {shares.map((s) => <option key={s.user_id} value={s.user_id}>{s.display_name} ({s.email})</option>)}
+                </NativeSelect>
+              </Field>
+              <Field><Label htmlFor="transfer-retained">Your personal access after transfer</Label>
+                <NativeSelect name="retained" id="transfer-retained" data-confirm-label="Your personal access after transfer" defaultValue="edit">
+                  <option value="edit">Can edit</option><option value="view">Can view</option><option value="none">None</option>
+                </NativeSelect>
+              </Field>
+              <div><Button type="submit">Send ownership offer</Button></div>
+            </ConfirmForm>
+          </CardContent>
+        </Card>
+      )}
       <div>
         <Button asChild variant="ghost">
           <a href="/models">← Back to my models</a>
@@ -626,15 +1000,28 @@ function LinkedModelsSwitch({ provider, state }: { provider: LinkedProvider; sta
   );
 }
 
-export function settingsPage(config: WebConfig, user: UserRow, linked: readonly string[], options: { flash?: Flash; passwordFree?: boolean; linkedModels?: readonly { readonly provider: LinkedProvider; readonly state: LinkedSwitch }[] } = {}): string {
+export function settingsPage(config: WebConfig, user: UserRow, linked: readonly string[], options: { flash?: Flash; passwordFree?: boolean; mail?: boolean; linkedModels?: readonly { readonly provider: LinkedProvider; readonly state: LinkedSwitch }[] } = {}): string {
   return page(
     <>
       <PageTitle>Settings</PageTitle>
       <Card>
         <CardHeader>
           <CardTitle>Your account</CardTitle>
-          <CardDescription>Email: {user.email}</CardDescription>
+          <CardDescription className="flex flex-wrap items-center gap-2">
+            <span>Email: {user.email}</span>
+            {user.email_confirmed_at ? <Badge data-testid="email-confirmed">Confirmed</Badge> : <Badge variant="secondary" data-testid="email-unconfirmed">Not confirmed</Badge>}
+          </CardDescription>
         </CardHeader>
+        {user.email_confirmed_at ? null : options.mail ? (
+          <form method="post" action="/settings/confirm-email" className="flex flex-wrap items-center gap-2">
+            <p className="text-sm">Confirm that you can receive email at this address, so you can accept invitations sent to it.</p>
+            <Button type="submit" variant="outline" size="sm">
+              Send confirmation link
+            </Button>
+          </form>
+        ) : (
+          <p className="text-sm text-(--mutiny-muted)">This server sends no email. A sign-in provider that vouches for your address confirms it, or whoever runs this server can confirm it.</p>
+        )}
         <form method="post" action="/settings/profile" className="flex flex-wrap items-end gap-2">
           <Field className="min-w-60 flex-1">
             <Label htmlFor="profile-name">Name</Label>
@@ -644,12 +1031,18 @@ export function settingsPage(config: WebConfig, user: UserRow, linked: readonly 
             Save name
           </Button>
         </form>
-        {config.providers.length > 0 ? (
+        {config.providers.length > 0 || linked.includes("google") ? (
           <>
             <Separator />
             <div className="flex flex-col gap-2">
               <h3 className="text-sm">Ways to log in</h3>
               <ul className="flex flex-col gap-2">
+                {linked.includes("google") ? (
+                  <li className="flex flex-wrap items-center gap-2 text-sm">
+                    <strong>Google</strong>
+                    <Badge>Linked</Badge>
+                  </li>
+                ) : null}
                 {config.providers.map((p) => {
                   const switchFor = linked.includes(p.id) ? options.linkedModels?.find((m) => m.provider.id === p.id) : undefined;
                   return (
@@ -679,15 +1072,21 @@ export function settingsPage(config: WebConfig, user: UserRow, linked: readonly 
       <Card id="password">
         <CardHeader>
           <CardTitle>Password</CardTitle>
-          <CardDescription>{user.password_hash ? "Changing it signs you out on every other device." : "You sign in through a linked account. Set a password to also log in with your email."}</CardDescription>
+          <CardDescription>
+            {config.supabase
+              ? "Changing it signs you out on every other device. Signed up with Google? Use Forgot your password to set an email password."
+              : user.password_hash
+                ? "Changing it signs you out on every other device."
+                : "You sign in through a linked account. Set a password to also log in with your email."}
+          </CardDescription>
         </CardHeader>
         <form method="post" action="/settings/password" className="flex flex-col gap-3">
-          {user.password_hash && !options.passwordFree ? <TextField label="Current password" name="current" type="password" autoComplete="current-password" required /> : null}
-          {user.password_hash && options.passwordFree ? <FieldHint>You just logged in with a linked account, so no current password is needed for the next few minutes.</FieldHint> : null}
+          {(config.supabase || user.password_hash) && !options.passwordFree ? <TextField label="Current password" name="current" type="password" autoComplete="current-password" required /> : null}
+          {!config.supabase && user.password_hash && options.passwordFree ? <FieldHint>You just logged in with a linked account, so no current password is needed for the next few minutes.</FieldHint> : null}
           <TextField label="New password" hint="At least 8 characters." name="password" type="password" autoComplete="new-password" required minLength={8} />
           <div>
             <Button type="submit" variant="outline" size="lg">
-              {user.password_hash ? "Change password" : "Set password"}
+              {config.supabase || user.password_hash ? "Change password" : "Set password"}
             </Button>
           </div>
         </form>
@@ -803,7 +1202,10 @@ export function connectPage(config: WebConfig, user: UserRow, view: ConnectView,
           </li>
         </ul>
         <CardDescription>
-          Your assistant opens a MutinyBIM sign-in page: log in and press Allow. No key to copy. It starts with the core tools (ten at most); ask it to turn on a tool family when a job needs one, or connect a family directly at <Code>{`${config.origin}/packs/<family>/mcp`}</Code> (for example <Code>{`${config.origin}/packs/electrical/mcp`}</Code>).
+          Your assistant opens a MutinyBIM sign-in page: log in and press Allow. No key to copy. It starts with the core tools (ten at most): <strong>@permitzip/bim-script</strong> is the primary AI capability layer, and 138 of the 159 legacy pack tools are already covered by scripts. Legacy single-purpose MCP packs are being retired and no new MCP tools will be added.
+        </CardDescription>
+        <CardDescription>
+          Only 21 tools remain genuine host steps (rendering view/sheet images, printing PDFs, issuing sets, firm and schedule libraries, Autodesk Docs, and lint settings). Turn on a family with <Code>bim_enable_pack</Code> only when you need one of those host steps — or, for clients that do not dynamically refresh tool lists (such as Claude remote connectors), connect directly to <Code>{`${config.origin}/packs/<family>/mcp`}</Code> (for example <Code>{`${config.origin}/packs/model/mcp`}</Code> for rendering/printing).
         </CardDescription>
         <CardDescription>
           When your assistant can't ask you itself, its changes wait on <a href="/approvals">Approvals</a> until you press Approve. Its scripts run here in a sealed box with no network; a script only previews until you approve what it does.

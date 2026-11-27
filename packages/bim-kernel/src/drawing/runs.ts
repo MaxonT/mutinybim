@@ -121,6 +121,8 @@ export interface DrawPartSymbolOptions {
   readonly takenBoxes?: PartLabelStore;
   /** Optional sink notified whenever an automatic part mark is placed (used for interactive mark picking/dragging). */
   readonly onMarkPlaced?: (mark: { readonly partId: string; readonly text: string; readonly at: Vec2; readonly sizeMm: number }) => void;
+  /** Skip per-part clearance rendering when the caller batches and merges clearances across all visible parts. */
+  readonly skipClearances?: boolean;
 }
 
 export interface RunDrawOptions {
@@ -138,6 +140,14 @@ export interface RunDrawOptions {
   readonly clipBounds?: { readonly min: Vec2; readonly max: Vec2 };
   /** Optional resolver for a connected fitting's own single-line decision (handles mismatched category overrides). */
   readonly fittingIsSingleLine?: (f: RunFitting) => boolean;
+  /** Optional 2D plan-only perpendicular display offset (model mm) for separating vertically stacked single-line runs without moving 3D geometry. */
+  readonly displayOffset?: Vec2;
+  /** Optional normalized [t0, t1] break intervals along a single-line segment where a higher run crosses over it. */
+  readonly crossingGaps?: readonly (readonly [number, number])[];
+  /** Optional true vector circle callback for rise/drop transitions so circles never look faceted. */
+  readonly circle?: (center: Vec2, radius: number, pen: Pen) => void;
+  /** Optional shared obstacle index so run labels avoid colliding with marks and symbols. */
+  readonly takenBoxes?: PartLabelIndex;
 }
 
 const plan = (p: { x: number; y: number }): Vec2 => ({ x: p.x, y: p.y });
@@ -175,8 +185,12 @@ export function systemLine(model: ModelState, systemId: string): { readonly dash
   return { dash: style?.dash ? [...style.dash] : undefined, weight: style?.weight, lineCode: systemLineCode(model.elements, systemId) };
 }
 
-function circle(center: Vec2, r: number, line: LineFn, pen: Pen): void {
-  const n = 16;
+function circle(center: Vec2, r: number, line: LineFn, pen: Pen, circleFn?: (c: Vec2, radius: number, p: Pen) => void): void {
+  if (circleFn) {
+    circleFn(center, r, pen);
+    return;
+  }
+  const n = 24;
   for (let i = 0; i < n; i++) {
     const a = (i / n) * Math.PI * 2;
     const b = ((i + 1) / n) * Math.PI * 2;
@@ -184,9 +198,9 @@ function circle(center: Vec2, r: number, line: LineFn, pen: Pen): void {
   }
 }
 
-function riseDot(center: Vec2, r: number, line: LineFn, pen: Pen): void {
+function riseDot(center: Vec2, r: number, line: LineFn, pen: Pen, circleFn?: (c: Vec2, radius: number, p: Pen) => void): void {
   const dr = r * 0.34;
-  circle(center, dr, line, pen);
+  circle(center, dr, line, pen, circleFn);
   line({ x: center.x - dr, y: center.y }, { x: center.x + dr, y: center.y }, pen);
   line({ x: center.x, y: center.y - dr }, { x: center.x, y: center.y + dr }, pen);
 }
@@ -239,6 +253,10 @@ function schematicEndTrimMm(model: ModelState, seg: RunSegment, end: "start" | "
   }
   if ((f.fittingType === "tee" || f.fittingType === BRANCH_TAP_FITTING) && f.ports.some((pt) => !flatDir(pt.direction) && pt.direction.z > 0.5)) {
     return SCHEMATIC_NODE_RADIUS_MM * scaleMmPerPaperMm;
+  }
+  if (f.fittingType === "wye" && f.host && f.ports[0] && flatDir(f.ports[0].direction)) {
+    // Stop the horizontal branch leg where the 45° wye lateral sweep begins so the junction reads as a true wye, not a 90° tee.
+    return SCHEMATIC_FITTING_OFFSET_MM * 1.45 * scaleMmPerPaperMm;
   }
   return 0;
 }
@@ -323,6 +341,68 @@ function drawSingleLineWithCode(a: Vec2, b: Vec2, pen: Pen, dash: number[] | und
   if (len - cursor > 1e-3) line(add(a, scale(u, cursor)), b, pen, dash);
 }
 
+/** Place a run size/flex label avoiding existing marks and symbols in `taken`. */
+function placeRunLabel(base: Vec2, text: string, sizeMm: number, scaleMmPerPaperMm: number, taken: PartLabelIndex): Vec2 {
+  const halfW = Math.max(sizeMm * 0.8, text.length * sizeMm * 0.36) * scaleMmPerPaperMm;
+  const halfH = sizeMm * 0.72 * scaleMmPerPaperMm;
+  const boxAt = (c: Vec2): PartLabelBox => ({ min: { x: c.x - halfW, y: c.y - halfH }, max: { x: c.x + halfW, y: c.y + halfH } });
+  const step = Math.max(halfH * 2.2, 4.0 * scaleMmPerPaperMm);
+  const candidates: Vec2[] = [
+    base,
+    { x: base.x, y: base.y + step },
+    { x: base.x, y: base.y - step },
+    { x: base.x + halfW * 1.2, y: base.y },
+    { x: base.x - halfW * 1.2, y: base.y },
+    { x: base.x + halfW * 1.2, y: base.y + step },
+    { x: base.x - halfW * 1.2, y: base.y - step },
+  ];
+  for (const c of candidates) {
+    const b = boxAt(c);
+    if (!taken.overlaps(b)) {
+      taken.add(b);
+      return c;
+    }
+  }
+  taken.add(boxAt(base));
+  return base;
+}
+
+/** Draw a single-line segment with optional crossing-gap breaks where higher runs pass over it. */
+function drawSingleLineWithGaps(
+  a: Vec2,
+  b: Vec2,
+  pen: Pen,
+  dash: number[] | undefined,
+  line: LineFn,
+  scaleMmPerPaperMm: number,
+  lineCode: string | undefined,
+  inlineText: InlineTextFn | undefined,
+  clipBounds: { readonly min: Vec2; readonly max: Vec2 } | undefined,
+  crossingGaps: readonly (readonly [number, number])[] | undefined,
+): void {
+  if (!crossingGaps || crossingGaps.length === 0) {
+    drawSingleLineWithCode(a, b, pen, dash, line, scaleMmPerPaperMm, lineCode, inlineText, clipBounds);
+    return;
+  }
+  const sorted = [...crossingGaps]
+    .map(([t0, t1]) => [Math.max(0, Math.min(1, t0)), Math.max(0, Math.min(1, t1))] as const)
+    .filter(([t0, t1]) => t1 > t0 + 1e-4)
+    .sort((x, y) => x[0] - y[0]);
+  const merged: Array<[number, number]> = [];
+  for (const [t0, t1] of sorted) {
+    const last = merged[merged.length - 1];
+    if (last && t0 <= last[1]) last[1] = Math.max(last[1], t1);
+    else merged.push([t0, t1]);
+  }
+  const lerp = (t: number): Vec2 => ({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
+  let cur = 0;
+  for (const [g0, g1] of merged) {
+    if (g0 > cur + 1e-4) drawSingleLineWithCode(lerp(cur), lerp(g0), pen, dash, line, scaleMmPerPaperMm, lineCode, inlineText, clipBounds);
+    cur = Math.max(cur, g1);
+  }
+  if (cur < 1 - 1e-4) drawSingleLineWithCode(lerp(cur), b, pen, dash, line, scaleMmPerPaperMm, lineCode, inlineText, clipBounds);
+}
+
 export function drawRunSegment(model: ModelState, seg: RunSegment, line: LineFn, label: TextFn | null, scaleMmPerPaperMm: number, opts?: RunDrawOptions): void {
   const detail = opts?.detail ?? "medium";
   const singleLineBelowMm = opts?.singleLineBelowMm ?? null;
@@ -330,11 +410,11 @@ export function drawRunSegment(model: ModelState, seg: RunSegment, line: LineFn,
   const w = singleLine ? sizeWidth(seg.size) : drawnWidth(seg.size);
   const { dash, weight } = systemLine(model, seg.systemId);
   const singlePen = weight ?? opts?.singleLinePen ?? "wide";
-  const a = plan(seg.start);
-  const b = plan(seg.end);
+  const off = singleLine ? opts?.displayOffset : undefined;
+  const a = off ? add(plan(seg.start), off) : plan(seg.start);
+  const b = off ? add(plan(seg.end), off) : plan(seg.end);
   if (seg.flex) {
     if (singleLine) {
-      // Single-line flex: draw its curved centreline.
       const pts = seg.flex.path;
       for (let i = 0; i + 1 < pts.length; i++) {
         const p0 = pts[i];
@@ -342,11 +422,25 @@ export function drawRunSegment(model: ModelState, seg: RunSegment, line: LineFn,
         if (p0 && p1) line(plan(p0), plan(p1), singlePen, dash);
       }
     } else {
-      // Flex: both edges along its curve with ticks across, labelled as flex.
+      // Flex: both edges along its curve with ticks across, plus round collar ring where it turns down into a device neck.
       for (const [p, q, what] of flexPlanLines(seg)) line(p, q, what === "edge" ? "medium" : "thin");
+      if (seg.end.z < seg.start.z - 50) {
+        const r = (seg.size.shape === "round" ? seg.size.diameter : 200) / 2;
+        circle(plan(seg.end), r, line, "medium", opts?.circle);
+      }
     }
     const mid = seg.flex.path[Math.floor(seg.flex.path.length / 2)] ?? seg.start;
-    if (label) label(add(plan(mid), { x: 0, y: (singleLine ? 0 : sizeWidth(seg.size) / 2) + 6 * scaleMmPerPaperMm }), `${sizeLabel(seg.size)} FLEX`, 2.5);
+    if (label) {
+      const txt = `${sizeLabel(seg.size)} FLEX`;
+      const tagSz = resolveTextStyle(model, "tag")?.textSizeMm ?? 2.4;
+      const fdx = Math.abs(seg.end.x - seg.start.x);
+      const fdy = Math.abs(seg.end.y - seg.start.y);
+      const pad = (singleLine ? 0 : sizeWidth(seg.size) / 2) + 4.5 * scaleMmPerPaperMm;
+      // Offset label perpendicular to the flex run's dominant plan direction so vertical runs don't collide with horizontal trunks.
+      const baseAt = fdy > fdx ? add(plan(mid), { x: pad + txt.length * 0.45 * tagSz * scaleMmPerPaperMm, y: 0 }) : add(plan(mid), { x: 0, y: pad });
+      const at = opts?.takenBoxes ? placeRunLabel(baseAt, txt, tagSz, scaleMmPerPaperMm, opts.takenBoxes) : baseAt;
+      label(at, txt, tagSz, "middle", { mask: true });
+    }
     return;
   }
   drawInsulationPlan(model, seg, line);
@@ -370,13 +464,24 @@ export function drawRunSegment(model: ModelState, seg: RunSegment, line: LineFn,
       });
       if (!ownedByFitting) {
         const pen = seg.domain === "duct" ? (weight ?? "medium") : singlePen;
-        circle(a, h, line, pen);
-        riseDot(a, h, line, "thin");
+        circle(a, h, line, pen, opts?.circle);
+        riseDot(a, h, line, "thin", opts?.circle);
       }
     } else {
-      circle(a, h, line, weight ?? "medium");
+      circle(a, h, line, weight ?? "medium", opts?.circle);
       const r = h * 0.7;
       line({ x: a.x - r, y: a.y - r }, { x: a.x + r, y: a.y + r }, "thin");
+    }
+    // Label full-storey vertical pipe stacks/risers (>= 1.8 m vertical span) cleanly on floor plans.
+    const dz = Math.abs(seg.end.z - seg.start.z);
+    if (label && singleLine && dz >= 1800) {
+      const code = opts?.lineCode ? ` ${opts.lineCode}` : "";
+      const dir = seg.end.z < seg.start.z ? "DN" : "UP";
+      const txt = `${sizeLabel(seg.size)}${code} ${dir}`;
+      const tagSz = Math.min(2.2, resolveTextStyle(model, "tag")?.textSizeMm ?? 2.2);
+      const baseAt = add(a, { x: h + (txt.length * 0.34 * tagSz + 2.5) * scaleMmPerPaperMm, y: 2.2 * scaleMmPerPaperMm });
+      const at = opts?.takenBoxes ? placeRunLabel(baseAt, txt, tagSz, scaleMmPerPaperMm, opts.takenBoxes) : baseAt;
+      label(at, txt, tagSz, "middle", { mask: true });
     }
     return;
   }
@@ -410,12 +515,15 @@ export function drawRunSegment(model: ModelState, seg: RunSegment, line: LineFn,
     const trimB = opts ? Math.min(runLen * 0.45, schematicEndTrimMm(model, seg, "end", scaleMmPerPaperMm, detail, singleLineBelowMm, opts.fittingIsSingleLine)) : 0;
     const pa = trimA > 0 ? add(a, scale(u, trimA)) : a;
     const pb = trimB > 0 ? add(b, scale(u, -trimB)) : b;
-    drawSingleLineWithCode(pa, pb, singlePen, dash, line, scaleMmPerPaperMm, opts?.lineCode, opts?.inlineText, opts?.clipBounds);
+    drawSingleLineWithGaps(pa, pb, singlePen, dash, line, scaleMmPerPaperMm, opts?.lineCode, opts?.inlineText, opts?.clipBounds, opts?.crossingGaps);
   }
   const run = Math.hypot(b.x - a.x, b.y - a.y);
   if (label && run / scaleMmPerPaperMm > 25) {
-    const at = add(scale(add(a, b), 0.5), scale(n, (!singleLine ? w / 2 : 0) + 6 * scaleMmPerPaperMm));
-    label(at, sizeLabel(seg.size), 2.5);
+    const txt = sizeLabel(seg.size);
+    const tagSz = resolveTextStyle(model, "tag")?.textSizeMm ?? 2.4;
+    const baseAt = add(scale(add(a, b), 0.5), scale(n, (!singleLine ? w / 2 : 0) + 6 * scaleMmPerPaperMm));
+    const at = opts?.takenBoxes ? placeRunLabel(baseAt, txt, tagSz, scaleMmPerPaperMm, opts.takenBoxes) : baseAt;
+    label(at, txt, tagSz, "middle", { mask: true });
   }
 }
 
@@ -456,8 +564,16 @@ function drawBody(model: ModelState, f: RunFitting, line: LineFn, vanes: boolean
  * sized in paper mm so elbows, tees, wyes, reducers, caps and rise/drop transitions
  * read crisply at every drawing scale instead of bare right angles.
  */
-function drawSchematicFitting(model: ModelState, f: RunFitting, line: LineFn, scaleMmPerPaperMm: number, defaultPen: Pen): void {
-  const p = plan(f.position);
+function drawSchematicFitting(
+  model: ModelState,
+  f: RunFitting,
+  line: LineFn,
+  scaleMmPerPaperMm: number,
+  defaultPen: Pen,
+  circleFn?: (c: Vec2, r: number, pen: Pen) => void,
+  displayOffset?: Vec2,
+): void {
+  const p = displayOffset ? add(plan(f.position), displayOffset) : plan(f.position);
   const { weight } = systemLine(model, f.systemId);
   const pen = weight ?? defaultPen;
   const tickHalf = SCHEMATIC_TICK_HALF_MM * scaleMmPerPaperMm;
@@ -496,11 +612,11 @@ function drawSchematicFitting(model: ModelState, f: RunFitting, line: LineFn, sc
         }
         return;
       }
-      // Vertical transition elbow (horizontal pipe turning UP or DOWN).
+      // Vertical transition elbow (horizontal run turning UP or DOWN).
       const vPort = !flatDir(pa.direction) ? pa : !flatDir(pb.direction) ? pb : null;
       const hPort = flatDir(pa.direction) ? pa : flatDir(pb.direction) ? pb : null;
-      circle(p, nodeR, line, pen);
-      if (vPort && vPort.direction.z > 0.5) riseDot(p, nodeR, line, "thin");
+      circle(p, nodeR, line, pen, circleFn);
+      if (vPort && vPort.direction.z > 0.5) riseDot(p, nodeR, line, "thin", circleFn);
       if (hPort) jointTick(p, unit(plan(hPort.direction)), nodeR + 0.5 * scaleMmPerPaperMm, tickHalf * 0.85, line);
       return;
     }
@@ -509,17 +625,17 @@ function drawSchematicFitting(model: ModelState, f: RunFitting, line: LineFn, sc
       const vPort = f.ports.find((pt) => !flatDir(pt.direction));
       const flatPorts = f.ports.filter((pt) => flatDir(pt.direction));
       if (vPort) {
-        circle(p, nodeR, line, pen);
-        if (vPort.direction.z > 0.5) riseDot(p, nodeR, line, "thin");
+        circle(p, nodeR, line, pen, circleFn);
+        if (vPort.direction.z > 0.5) riseDot(p, nodeR, line, "thin", circleFn);
         for (const pt of flatPorts) {
-          const pp = plan(pt.position);
+          const pp = displayOffset ? add(plan(pt.position), displayOffset) : plan(pt.position);
           if (Math.hypot(pp.x - p.x, pp.y - p.y) > 1) line(p, pp, pen);
           jointTick(p, unit(plan(pt.direction)), nodeR + 0.5 * scaleMmPerPaperMm, tickHalf * 0.85, line);
         }
         return;
       }
       for (const pt of flatPorts) {
-        const pp = plan(pt.position);
+        const pp = displayOffset ? add(plan(pt.position), displayOffset) : plan(pt.position);
         // Hosted branch ports sit on the trunk's outer face; bridge back to the single-line trunk centreline.
         if (Math.hypot(pp.x - p.x, pp.y - p.y) > 1) line(p, pp, pen);
         jointTick(pp, unit(plan(pt.direction)), offset, tickHalf, line);
@@ -527,13 +643,10 @@ function drawSchematicFitting(model: ModelState, f: RunFitting, line: LineFn, sc
       return;
     }
     case "wye": {
+      // ASPE/AIA 1D wye symbol: swept 45° lateral joining trunk in flow direction (distinct from a 90° tee).
       const flatPorts = f.ports.filter((pt) => flatDir(pt.direction));
-      for (const pt of flatPorts) {
-        const pp = plan(pt.position);
-        if (Math.hypot(pp.x - p.x, pp.y - p.y) > 1) line(p, pp, pen);
-        jointTick(pp, unit(plan(pt.direction)), offset, tickHalf, line);
-      }
-      // Swept 45° diagonal marker on the branch port so wyes read distinctly from tees.
+      const hostSeg = f.host ? model.elements[f.host.segmentId] : undefined;
+      const sweepLen = offset * 1.45;
       if (flatPorts.length >= 3) {
         const dirs = flatPorts.map((pt) => unit(plan(pt.direction)));
         let branchIdx = 2;
@@ -546,19 +659,39 @@ function drawSchematicFitting(model: ModelState, f: RunFitting, line: LineFn, sc
             break;
           }
         }
+        for (let i = 0; i < flatPorts.length; i++) {
+          const pt = flatPorts[i]!;
+          const pp = plan(pt.position);
+          if (i !== branchIdx && Math.hypot(pp.x - p.x, pp.y - p.y) > 1) line(p, pp, pen);
+          jointTick(pp, unit(plan(pt.direction)), i === branchIdx ? sweepLen : offset, tickHalf, line);
+        }
         const bd = dirs[branchIdx];
         const md = dirs[(branchIdx + 1) % dirs.length];
         if (bd && md) {
-          line(add(p, scale(bd, offset * 0.9)), add(p, scale(md, offset * 0.9)), "thin");
+          const branchPt = add(p, scale(bd, sweepLen));
+          const trunkPt = add(p, scale(md, sweepLen));
+          line(branchPt, trunkPt, pen);
+          const bp = flatPorts[branchIdx] ? plan(flatPorts[branchIdx]!.position) : p;
+          if (Math.hypot(bp.x - p.x, bp.y - p.y) > 1) line(branchPt, bp, pen);
         }
       } else if (pa) {
-        // Hosted wye on a continuous trunk: derive trunk axis from the host segment when available.
-        const hostSeg = f.host ? model.elements[f.host.segmentId] : undefined;
+        // Hosted combination wye on a continuous trunk: sweep 45° downstream into flow direction.
         const bd = unit(plan(pa.direction));
-        const trunkDir = hostSeg?.kind === "run_segment" && !vertical(hostSeg) ? unit(sub(plan(hostSeg.end), plan(hostSeg.start))) : perp(bd);
-        const branchStart = add(p, scale(bd, offset * 0.9));
-        const trunkPt = add(p, scale(trunkDir, offset * 0.9));
-        line(branchStart, trunkPt, "thin");
+        let trunkDir: Vec2;
+        if (hostSeg?.kind === "run_segment" && !vertical(hostSeg)) {
+          const segDir = unit(sub(plan(hostSeg.end), plan(hostSeg.start)));
+          // Sweep downhill along sloped gravity drains so flow direction reads immediately on plan.
+          trunkDir = hostSeg.end.z < hostSeg.start.z - 0.5 ? segDir : hostSeg.start.z < hostSeg.end.z - 0.5 ? scale(segDir, -1) : segDir;
+        } else {
+          trunkDir = perp(bd);
+        }
+        const branchPt = add(p, scale(bd, sweepLen));
+        const trunkPt = add(p, scale(trunkDir, sweepLen));
+        // Only draw the swept 45° diagonal (never a straight branch-to-trunk chord that turns a wye into a T+Y).
+        line(branchPt, trunkPt, pen);
+        jointTick(p, bd, sweepLen, tickHalf, line);
+        jointTick(p, trunkDir, sweepLen, tickHalf, line);
+        jointTick(p, scale(trunkDir, -1), offset, tickHalf, line);
       }
       return;
     }
@@ -639,7 +772,7 @@ function fittingSize(model: ModelState, f: RunFitting): RunSegment["size"] | und
   return undefined;
 }
 
-export function drawRunFitting(model: ModelState, f: RunFitting, line: LineFn, vanes = true, scaleMmPerPaperMm = 48, opts?: Pick<RunDrawOptions, "detail" | "singleLineBelowMm" | "singleLinePen">): void {
+export function drawRunFitting(model: ModelState, f: RunFitting, line: LineFn, vanes = true, scaleMmPerPaperMm = 48, opts?: Pick<RunDrawOptions, "detail" | "singleLineBelowMm" | "singleLinePen" | "circle" | "displayOffset">): void {
   drawInsulationPlan(model, f, line);
   const detail = opts?.detail ?? (vanes ? "fine" : "medium");
   const threshold = opts?.singleLineBelowMm ?? null;
@@ -672,7 +805,7 @@ export function drawRunFitting(model: ModelState, f: RunFitting, line: LineFn, v
   }
   const singleLine = opts !== undefined ? isSingleLineRun(f.domain, fittingSize(model, f), detail, threshold) : f.domain !== "duct";
   if (singleLine && opts !== undefined) {
-    drawSchematicFitting(model, f, line, scaleMmPerPaperMm, opts.singleLinePen ?? (f.domain === "duct" ? "wide" : "medium"));
+    drawSchematicFitting(model, f, line, scaleMmPerPaperMm, opts.singleLinePen ?? (f.domain === "duct" ? "wide" : "medium"), opts.circle, opts.displayOffset);
     return;
   }
   if (!singleLine && f.family !== undefined && drawBody(model, f, line, vanes)) return;
@@ -1013,9 +1146,11 @@ export function drawPartSymbol(
   }
   const symbolBox: PartLabelBox | null = Number.isFinite(bb.minX) ? { min: { x: bb.minX, y: bb.minY }, max: { x: bb.maxX, y: bb.maxY } } : null;
   if (symbolBox) addLabelBox(opts.takenBoxes, symbolBox);
-  if (part.mark && opts.showMark !== false) {
+  const partType = model.elements[part.typeId];
+  const rawMark = part.mark || (partType?.kind === "part_type" ? (partType.definition.typeMark ?? "") : "");
+  if (rawMark && opts.showMark !== false) {
     const markStyle = resolveTextStyle(model, "part_mark");
-    const markText = markStyle?.uppercase ? part.mark.toUpperCase() : part.mark;
+    const markText = markStyle?.uppercase ? rawMark.toUpperCase() : rawMark;
     const markSize = markStyle?.textSizeMm ?? MARK_SIZE_MM;
     const markAt = placePartMark(part, markText, symbolBox, viewScale, opts.takenBoxes, hasCenterText, markSize);
     // Center the mark vertically on markAt (SVG/PDF text y is baseline).
@@ -1036,35 +1171,268 @@ export function drawPartSymbol(
     );
     opts.onMarkPlaced?.({ partId: part.id, text: markText, at: markAt, sizeMm: markSize });
   }
-  drawPartClearances(model, part, line, text, viewScale, opts.takenBoxes);
+  if (!opts.skipClearances) drawPartClearances(model, part, line, text, viewScale, opts.takenBoxes);
 }
 
-/** Clearance zones draw dashed (paper mm), never as part of the part's body. */
-export const CLEARANCE_DASH: readonly number[] = [3, 1.5];
+/** Clearance zones draw dashed (paper mm) in halftone, never as part of the part's body. */
+export const CLEARANCE_DASH: readonly number[] = [2.2, 1.2];
 
-/** A placed part's clearance zones in plan: a dashed outline each, named cleanly away from the part mark. */
-export function drawPartClearances(model: ModelState, part: PartInstance, line: LineFn, text: TextFn, viewScale = DEFAULT_SYMBOL_SCALE, takenBoxes?: PartLabelStore): void {
-  for (const z of partClearances(model, part)) {
-    const c = z.corners;
-    for (let i = 0; i < 4; i++) line(c[i] ?? c[0], c[(i + 1) % 4] ?? c[0], "thin", [...CLEARANCE_DASH]);
-    const label = z.name.toUpperCase();
-    const mid: Vec2 = { x: (c[0].x + c[2].x) / 2, y: (c[0].y + c[2].y) / 2 };
-    // Push the clearance label toward the outer side of the zone (away from the part origin) if the center collides.
-    const outDir = sub(mid, part.position);
-    const outLen = Math.hypot(outDir.x, outDir.y);
-    const candidates: Vec2[] = [mid];
-    if (outLen > 1) {
-      const u = scale(outDir, 1 / outLen);
-      candidates.push(add(mid, scale(u, outLen * 0.45)), add(mid, scale(u, outLen * 0.85)));
+const CLEARANCE_LABEL_MAX_MM = CLEARANCE_TEXT_MM * 0.65;
+const CLEARANCE_LABEL_MIN_MM = 0.9;
+
+/** Compact CAD label for tight clearance boxes when the full zone name would clutter equipment or marks. */
+function compactClearanceLabel(label: string): string {
+  const code = label.match(/\b\d{3}\.\d+\b/)?.[0];
+  if (code) return `${code} CLR`;
+  if (/WORKING\s+SPACE/i.test(label)) return "WORK CLR";
+  if (/SERVICE/i.test(label)) return "SVC CLR";
+  if (/COMBUSTIBLE/i.test(label)) return "COMB CLR";
+  return label.length > 12 ? "CLR" : label;
+}
+
+/** Wrap a clearance zone label onto lines that stay strictly inside its dashed outline. */
+function wrapClearanceText(label: string, maxWorldW: number, fontMm: number, viewScale: number): readonly string[] {
+  const charW = fontMm * 0.58 * viewScale;
+  const maxChars = Math.max(6, Math.floor((maxWorldW * 0.86) / Math.max(1, charW)));
+  if (label.length <= maxChars) return [label];
+  const words = label.split(/\s+/).filter(Boolean);
+  const lines: string[] = [];
+  let cur = "";
+  for (const w of words) {
+    if (!cur) {
+      cur = w;
+    } else if (cur.length + 1 + w.length <= maxChars) {
+      cur = `${cur} ${w}`;
+    } else {
+      lines.push(cur);
+      cur = w;
     }
-    let at = mid;
-    if (takenBoxes) {
-      const clear = candidates.find((p) => !overlapsLabelStore(takenBoxes, worldTextBox(p, label, CLEARANCE_TEXT_MM, viewScale)));
-      at = clear ?? candidates[candidates.length - 1] ?? mid;
-      addLabelBox(takenBoxes, worldTextBox(at, label, CLEARANCE_TEXT_MM, viewScale));
-    }
-    text(at, label, CLEARANCE_TEXT_MM, "middle");
   }
+  if (cur) lines.push(cur);
+  return lines;
+}
+
+function drawClearanceLabel(
+  label: string,
+  candidates: ReadonlyArray<{ readonly mid: Vec2; readonly w: number; readonly h: number }>,
+  text: TextFn,
+  viewScale: number,
+  takenBoxes?: PartLabelStore,
+): void {
+  const short = compactClearanceLabel(label);
+  const textsToTry = short !== label ? [label, short] : [label];
+  for (const cand of candidates) {
+    for (const candidateText of textsToTry) {
+      let fontMm = CLEARANCE_LABEL_MAX_MM;
+      let lines = wrapClearanceText(candidateText, cand.w, fontMm, viewScale);
+      const fitsBox = () =>
+        lines.length <= 2 &&
+        lines.length * fontMm * 1.25 * viewScale <= cand.h * 0.82 &&
+        lines.every((l) => l.length * fontMm * 0.58 * viewScale <= cand.w * 0.88);
+      while (fontMm > CLEARANCE_LABEL_MIN_MM && !fitsBox()) {
+        fontMm = Math.max(CLEARANCE_LABEL_MIN_MM, fontMm - 0.1);
+        lines = wrapClearanceText(candidateText, cand.w, fontMm, viewScale);
+      }
+      if (!fitsBox()) continue;
+
+      const stepWorld = fontMm * 1.25 * viewScale;
+      const totalH = (lines.length - 1) * stepWorld;
+      const longest = lines.reduce((a, b) => (b.length > a.length ? b : a), "");
+      const baseBox = worldTextBox(cand.mid, longest, fontMm, viewScale);
+      const fullBox: PartLabelBox = {
+        min: { x: baseBox.min.x, y: cand.mid.y - (totalH + fontMm * viewScale) / 2 },
+        max: { x: baseBox.max.x, y: cand.mid.y + (totalH + fontMm * viewScale) / 2 },
+      };
+      // Never draw clearance text over an existing equipment mark or symbol.
+      if (takenBoxes && overlapsLabelStore(takenBoxes, fullBox)) continue;
+
+      const baselineShift = fontMm * 0.35 * viewScale;
+      for (let i = 0; i < lines.length; i++) {
+        const p: Vec2 = { x: cand.mid.x, y: cand.mid.y + totalH / 2 - i * stepWorld - baselineShift };
+        text(p, lines[i]!, fontMm, "middle");
+      }
+      addLabelBox(takenBoxes, fullBox);
+      return;
+    }
+  }
+}
+
+export interface BatchedClearanceZone {
+  readonly name: string;
+  readonly corners: readonly [Vec2, Vec2, Vec2, Vec2];
+  readonly line: LineFn;
+  readonly text: TextFn;
+}
+
+/** Merge touching or overlapping clearance zones with the same label and alignment into one clean dashed boundary and one centered label. */
+export function drawPartClearancesBatch(
+  zones: readonly BatchedClearanceZone[],
+  viewScale = DEFAULT_SYMBOL_SCALE,
+  takenBoxes?: PartLabelStore,
+): void {
+  if (zones.length === 0) return;
+  const MERGE_TOL_MM = 50;
+  // Canonical orientation angle in [0, pi/2) so 0/90/180/270 boxes share one local orthogonal grid.
+  const angleOf = (c: readonly [Vec2, Vec2, Vec2, Vec2]): number => {
+    const a = Math.atan2(c[1].y - c[0].y, c[1].x - c[0].x);
+    let m = ((a % (Math.PI / 2)) + Math.PI / 2) % (Math.PI / 2);
+    if (Math.abs(m - Math.PI / 2) < 0.03) m = 0;
+    return m;
+  };
+  interface LocalBox {
+    readonly zone: BatchedClearanceZone;
+    readonly label: string;
+    readonly angle: number;
+    readonly minU: number;
+    readonly maxU: number;
+    readonly minV: number;
+    readonly maxV: number;
+  }
+  const byBucket = new Map<string, LocalBox[]>();
+  for (const zone of zones) {
+    const label = zone.name.toUpperCase();
+    const angle = angleOf(zone.corners);
+    const bucketAngle = Math.round((angle * 180) / Math.PI / 2) * 2;
+    const key = `${label}\u0000${bucketAngle}`;
+    const cos = Math.cos(-angle);
+    const sin = Math.sin(-angle);
+    let minU = Infinity;
+    let maxU = -Infinity;
+    let minV = Infinity;
+    let maxV = -Infinity;
+    for (const q of zone.corners) {
+      const u = q.x * cos - q.y * sin;
+      const v = q.x * sin + q.y * cos;
+      if (u < minU) minU = u;
+      if (u > maxU) maxU = u;
+      if (v < minV) minV = v;
+      if (v > maxV) maxV = v;
+    }
+    const list = byBucket.get(key);
+    const entry: LocalBox = { zone, label, angle, minU, maxU, minV, maxV };
+    if (list) list.push(entry);
+    else byBucket.set(key, [entry]);
+  }
+
+  for (const list of byBucket.values()) {
+    // Connected components of overlapping or touching boxes (within MERGE_TOL_MM).
+    const visited = new Array<boolean>(list.length).fill(false);
+    for (let start = 0; start < list.length; start++) {
+      if (visited[start]) continue;
+      const cluster: LocalBox[] = [];
+      const stack = [start];
+      visited[start] = true;
+      while (stack.length > 0) {
+        const idx = stack.pop()!;
+        const cur = list[idx]!;
+        cluster.push(cur);
+        for (let j = 0; j < list.length; j++) {
+          if (visited[j]) continue;
+          const o = list[j]!;
+          if (cur.minU <= o.maxU + MERGE_TOL_MM && cur.maxU >= o.minU - MERGE_TOL_MM && cur.minV <= o.maxV + MERGE_TOL_MM && cur.maxV >= o.minV - MERGE_TOL_MM) {
+            visited[j] = true;
+            stack.push(j);
+          }
+        }
+      }
+      const rep = cluster[0]!;
+      if (cluster.length === 1) {
+        const c = rep.zone.corners;
+        for (let i = 0; i < 4; i++) rep.zone.line(c[i] ?? c[0], c[(i + 1) % 4] ?? c[0], "thin", [...CLEARANCE_DASH]);
+        const xs = c.map((p) => p.x);
+        const ys = c.map((p) => p.y);
+        const zoneW = Math.max(1, Math.max(...xs) - Math.min(...xs));
+        const zoneH = Math.max(1, Math.max(...ys) - Math.min(...ys));
+        const mid: Vec2 = { x: (Math.min(...xs) + Math.max(...xs)) / 2, y: (Math.min(...ys) + Math.max(...ys)) / 2 };
+        drawClearanceLabel(rep.label, [{ mid, w: zoneW, h: zoneH }], rep.zone.text, viewScale, takenBoxes);
+        continue;
+      }
+
+      // Snap near-identical coordinates (within MERGE_TOL_MM) so side-by-side boxes with tiny gaps fuse into one smooth outline.
+      const dedupeCoords = (raw: number[]): number[] => {
+        raw.sort((a, b) => a - b);
+        const out: number[] = [];
+        for (const v of raw) {
+          if (out.length === 0 || v - out[out.length - 1]! > 1e-3) out.push(v);
+        }
+        return out;
+      };
+      const us = dedupeCoords(cluster.flatMap((b) => [b.minU, b.maxU]));
+      const vs = dedupeCoords(cluster.flatMap((b) => [b.minV, b.maxV]));
+      const cols = us.length - 1;
+      const rows = vs.length - 1;
+      const filled = Array.from({ length: cols }, () => new Array<boolean>(rows).fill(false));
+      const pad = MERGE_TOL_MM / 2;
+      for (let ci = 0; ci < cols; ci++) {
+        const mu = ((us[ci]! + us[ci + 1]!) / 2);
+        for (let ri = 0; ri < rows; ri++) {
+          const mv = ((vs[ri]! + vs[ri + 1]!) / 2);
+          // Fill cell if covered by any rectangle, or if it bridges a tiny gap (<= MERGE_TOL_MM) between two touching boxes along one axis.
+          if (cluster.some((b) => mu >= b.minU - 1e-3 && mu <= b.maxU + 1e-3 && mv >= b.minV - 1e-3 && mv <= b.maxV + 1e-3)) {
+            filled[ci]![ri] = true;
+          } else if (us[ci + 1]! - us[ci]! <= MERGE_TOL_MM && cluster.some((b) => mu >= b.minU - pad && mu <= b.maxU + pad && mv >= b.minV - 1e-3 && mv <= b.maxV + 1e-3)) {
+            filled[ci]![ri] = true;
+          } else if (vs[ri + 1]! - vs[ri]! <= MERGE_TOL_MM && cluster.some((b) => mv >= b.minV - pad && mv <= b.maxV + pad && mu >= b.minU - 1e-3 && mu <= b.maxU + 1e-3)) {
+            filled[ci]![ri] = true;
+          }
+        }
+      }
+      const cos = Math.cos(rep.angle);
+      const sin = Math.sin(rep.angle);
+      const toWorld = (u: number, v: number): Vec2 => ({ x: u * cos - v * sin, y: u * sin + v * cos });
+      // Emit merged horizontal boundary segments.
+      for (let ri = 0; ri <= rows; ri++) {
+        let runStart: number | null = null;
+        for (let ci = 0; ci <= cols; ci++) {
+          const below = ci < cols && ri > 0 ? filled[ci]![ri - 1]! : false;
+          const above = ci < cols && ri < rows ? filled[ci]![ri]! : false;
+          const isEdge = ci < cols && below !== above;
+          if (isEdge && runStart === null) runStart = ci;
+          else if (!isEdge && runStart !== null) {
+            rep.zone.line(toWorld(us[runStart]!, vs[ri]!), toWorld(us[ci]!, vs[ri]!), "thin", [...CLEARANCE_DASH]);
+            runStart = null;
+          }
+        }
+      }
+      // Emit merged vertical boundary segments.
+      for (let ci = 0; ci <= cols; ci++) {
+        let runStart: number | null = null;
+        for (let ri = 0; ri <= rows; ri++) {
+          const left = ri < rows && ci > 0 ? filled[ci - 1]![ri]! : false;
+          const right = ri < rows && ci < cols ? filled[ci]![ri]! : false;
+          const isEdge = ri < rows && left !== right;
+          if (isEdge && runStart === null) runStart = ri;
+          else if (!isEdge && runStart !== null) {
+            rep.zone.line(toWorld(us[ci]!, vs[runStart]!), toWorld(us[ci]!, vs[ri]!), "thin", [...CLEARANCE_DASH]);
+            runStart = null;
+          }
+        }
+      }
+      // Pick candidate interior positions inside the merged polygon's largest filled sub-rectangles
+      // (never in the empty notch of an L-shaped merged clearance), largest first.
+      const labelCands: Array<{ readonly mid: Vec2; readonly w: number; readonly h: number; readonly area: number }> = [];
+      for (const b of cluster) {
+        const w = Math.max(1, b.maxU - b.minU);
+        const h = Math.max(1, b.maxV - b.minV);
+        const cx = (b.minU + b.maxU) / 2;
+        const cy = (b.minV + b.maxV) / 2;
+        labelCands.push({ mid: toWorld(cx, cy), w, h, area: w * h });
+      }
+      labelCands.sort((a, b) => b.area - a.area);
+      drawClearanceLabel(rep.label, labelCands, rep.zone.text, viewScale, takenBoxes);
+    }
+  }
+}
+
+/** A placed part's clearance zones in plan: a dashed outline each, with wrapped text kept strictly inside the zone. */
+export function drawPartClearances(model: ModelState, part: PartInstance, line: LineFn, text: TextFn, viewScale = DEFAULT_SYMBOL_SCALE, takenBoxes?: PartLabelStore): void {
+  const zones: BatchedClearanceZone[] = partClearances(model, part).map((z) => ({
+    name: z.name,
+    corners: z.corners,
+    line,
+    text,
+  }));
+  drawPartClearancesBatch(zones, viewScale, takenBoxes);
 }
 
 /** Drawing category of a routed element (views can hide duct and pipe separately). */

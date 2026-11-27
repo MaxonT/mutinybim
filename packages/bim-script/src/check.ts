@@ -3,13 +3,12 @@ import {
   PartGeometryUnavailableError,
   PartModelError,
   executeCommand,
-  partImportReport,
+  partTypeImportReport,
   partTypeIssues,
   partViewLinework,
   partViewSvg,
   previewEdit,
   withUpgradePolicy,
-  resolveConnectors,
   type ModelState,
   type PartTypeDefinition,
   type PartView,
@@ -36,6 +35,8 @@ export type OutputLint = (before: ModelState, after: ModelState, changedIds: rea
 
 export interface CheckOptions {
   readonly lint?: OutputLint;
+  /** Called once after all edit batches succeed with the post-script model and every touched element id. */
+  readonly onAfterEdits?: (after: ModelState, touchedIds: readonly string[]) => void;
   /** Features the model server advertises (the slice's `features`): batches are decided under them, as the server will. */
   readonly features?: readonly string[];
   /** Part types: draw a picture of each view (needs the geometry engine; absent pictures are noted). Default true. */
@@ -56,7 +57,10 @@ export interface BatchCheck {
 
 export interface PartCheck {
   readonly typeId: string;
+  /** Blocking structural or schema problems (`partTypeIssues`): a type with problems cannot be saved. */
   readonly problems: readonly string[];
+  /** Advisory connector-report warnings (`partTypeImportReport`): surfaced in checks and approvals; saving is still allowed. */
+  readonly warnings: readonly string[];
   readonly pictures: Readonly<Partial<Record<PartView, string>>>;
   readonly notes: readonly string[];
 }
@@ -78,6 +82,7 @@ function checkIn(model: ModelState, raw: unknown, options: CheckOptions): Output
     return { kind: "part_types", ok: types.every((t) => t.problems.length === 0), types };
   }
   const batches: BatchCheck[] = [];
+  const touched = new Set<string>();
   let head = model;
   for (const [index, batch] of output.batches.entries()) {
     const preview = previewEdit(head, batch, { label: batch.label });
@@ -85,8 +90,8 @@ function checkIn(model: ModelState, raw: unknown, options: CheckOptions): Output
       batches.push({ label: batch.label, steps: batch.commands.length, status: "refused", message: preview.message, reopens: [], quantityChanges: [], lint: [], fingerprint: preview.fingerprint });
       return { kind: "edits", ok: false, steps: output.steps, batches };
     }
-    // The next batch (or lint) needs the head after this one; the last batch without lint doesn't.
-    if (!options.lint && index === output.batches.length - 1) {
+    // The next batch (or lint / post-edit clash check) needs the head after this one; the last batch without them doesn't.
+    if (!options.lint && !options.onAfterEdits && index === output.batches.length - 1) {
       batches.push({ label: batch.label, steps: batch.commands.length, status: "checked", reopens: preview.reopens, quantityChanges: preview.quantityChanges, lint: [], fingerprint: preview.fingerprint });
       break;
     }
@@ -95,17 +100,19 @@ function checkIn(model: ModelState, raw: unknown, options: CheckOptions): Output
       batches.push({ label: batch.label, steps: batch.commands.length, status: "refused", message: applied.error.message, reopens: [], quantityChanges: [], lint: [], fingerprint: preview.fingerprint });
       return { kind: "edits", ok: false, steps: output.steps, batches };
     }
+    for (const id of applied.changedIds) touched.add(id);
     const lint = options.lint ? options.lint(head, applied.model, applied.changedIds) : [];
     batches.push({ label: batch.label, steps: batch.commands.length, status: "checked", reopens: preview.reopens, quantityChanges: preview.quantityChanges, lint, fingerprint: preview.fingerprint });
     head = applied.model;
   }
+  options.onAfterEdits?.(head, [...touched]);
   return { kind: "edits", ok: true, steps: output.steps, batches };
 }
 
 function checkPart(typeId: string, def: PartTypeDefinition, pictures: boolean): PartCheck {
   const problems = partTypeIssues(def).map((i) => `${i.field}: ${i.message}`);
-  const report = partImportReport(def, resolveConnectors(def, def.typeValues));
-  for (const p of report.problems) problems.push(`${p.connectorLabel}: ${p.message} (${p.nextStep}).`);
+  const report = partTypeImportReport(def);
+  const warnings = report.problems.map((p) => `${p.connectorLabel}: ${p.message} (${p.nextStep}).`);
   const drawn: Partial<Record<PartView, string>> = {};
   const notes: string[] = [];
   // The view pictures draw the part's solid (kit bodies are all solid features); a hand-written definition of primitives only has none.
@@ -126,5 +133,5 @@ function checkPart(typeId: string, def: PartTypeDefinition, pictures: boolean): 
       }
     }
   }
-  return { typeId, problems, pictures: drawn, notes };
+  return { typeId, problems, warnings, pictures: drawn, notes };
 }

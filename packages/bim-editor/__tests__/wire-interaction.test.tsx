@@ -96,8 +96,8 @@ function setupDemoLayer(viewId: 'v-e101' | 'v-e102' | 'v-e103' = 'v-e102') {
 
 describe('ModelDrawingLayer electrical wire and home-run interactions inside rooms', () => {
   it('hovers and drags a circuit wire inside a room without rooms blocking it', () => {
-    const { hit, joins, submitted } = setupDemoLayer('v-e102')
-    const wire = joins.find((j) => j.linkId === 'ckt-hp-1' && j.a === 'lt-t1' && j.b === 'lt-t2')
+    const { hit, joins, submitted } = setupDemoLayer('v-e103')
+    const wire = joins.find((j) => j.linkId === 'ckt-hp-1' && j.a === 'lt-t2' && j.b === 'lt-t3')
     expect(wire).toBeDefined()
     const mid = wire!.points[Math.floor(wire!.points.length / 2)]!
 
@@ -120,8 +120,18 @@ describe('ModelDrawingLayer electrical wire and home-run interactions inside roo
     }
   })
 
+  it('does not leave ghost hoverable lighting wires when lighting_fixtures is hidden on the power plan', () => {
+    const { hit, joins } = setupDemoLayer('v-e102')
+    const wire = joins.find((j) => j.linkId === 'ckt-hp-1' && j.a === 'lt-t1' && j.b === 'lt-t2')
+    expect(wire).toBeDefined()
+    const mid = wire!.points[Math.floor(wire!.points.length / 2)]!
+
+    fireEvent.pointerMove(hit, { clientX: mid.x, clientY: mid.y })
+    expect(screen.queryByTestId('model-wire-hover')).toBeNull()
+  })
+
   it('right-clicks a wire inside a room and inserts a spline vertex', () => {
-    const { hit, joins, submitted } = setupDemoLayer('v-e102')
+    const { hit, joins, submitted } = setupDemoLayer('v-e103')
     const wire = joins.find((j) => j.linkId === 'ckt-hp-1' && j.a === 'lt-t1' && j.b === 'lt-t2')!
     const mid = wire.points[Math.floor(wire.points.length / 2)]!
 
@@ -135,7 +145,7 @@ describe('ModelDrawingLayer electrical wire and home-run interactions inside roo
   })
 
   it('drags a home-run arrow tip and label inside a room', () => {
-    const { hit, homeRuns, submitted } = setupDemoLayer('v-e102')
+    const { hit, homeRuns, submitted } = setupDemoLayer('v-e103')
     const hr = homeRuns.find((h) => h.linkId === 'ckt-hp-1')
     expect(hr).toBeDefined()
 
@@ -197,12 +207,17 @@ describe('ModelDrawingLayer electrical wire and home-run interactions inside roo
     fireEvent.click(screen.getByTestId('edit-controls-apply'))
 
     expect(closed).toBe(true)
-    expect(submitted).toHaveLength(1)
+    expect(submitted).toHaveLength(2)
     expect(submitted[0]?.command).toEqual({
       type: 'set_parameters',
       id: 'lt-d1',
       scope: 'instance',
       values: { switch_leg: 'z', control_type: 'dali', emergency: true, emergency_mode: 'switched' },
+    })
+    expect(submitted[1]?.command).toEqual({
+      type: 'set_element_values',
+      elementIds: ['lt-d1'],
+      values: { 'electrical.emergency_mode': 'battery_pack', 'electrical.egress_fixture': true },
     })
   })
 

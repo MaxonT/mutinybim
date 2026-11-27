@@ -1,8 +1,14 @@
 # Scripting coverage: what a script does of each tool
 
-The script API is the product. The MutinyBIM tool server lists 10 tools by default: five script tools (`bim_script_reference`, `bim_check_output`, `bim_run_script`, `bim_apply_output`, `bim_save_part_type`), four reads (`bim_model_summary`, `bim_query_elements`, `bim_inspect_network`, `bim_validation_issues`) and `bim_enable_pack`. Everything else is done by writing a script with `@permitzip/bim-script`.
+## Retirement policy
 
-The other 159 tools stay on the server, off, in families an agent can turn on (`--packs`, `/packs/<family>/mcp`, or `bim_enable_pack`). This page says, for each of them, what a script uses instead. Every tool marked **covered** is a retirement candidate; retiring any of them is the maintainer's call.
+`@permitzip/bim-script` is the primary AI capability layer. The daily-driver MutinyBIM MCP server stays at **10 tools at most**: five script tools (`bim_script_reference`, `bim_check_output`, `bim_run_script`, `bim_apply_output`, `bim_save_part_type`), four reads (`bim_model_summary`, `bim_query_elements`, `bim_inspect_network`, `bim_validation_issues`) and `bim_enable_pack`.
+
+- **No new legacy MCP tools will be added.** New model capabilities ship as `@permitzip/bim-script` functions and kernel/add-on commands, never as new single-purpose MCP tools.
+- **Legacy single-purpose MCP packs are being retired.** All **138** script-covered tools below are slated for retirement in favor of `@permitzip/bim-script`. Invoking any of those 138 legacy tools appends a plain-language hint pointing to `bim_script_reference` and its script equivalent from the shared map in `packages/bim-mcp/src/scripts/coverage.ts`.
+- **21 host-step tools stay MCP tools by design** (rendering, printing, issuing, firm/schedule libraries, Autodesk Docs, and host-stored lint/AI reads). They are never nudged toward scripts. Clients that do not dynamically refresh tool lists (for example Claude remote connectors) can connect directly to `/packs/<family>/mcp` when they genuinely need one of those 21 host-step tools.
+
+The other 159 tools stay on the server, off by default, in families an agent can turn on (`--packs`, `/packs/<family>/mcp`, or `bim_enable_pack`). This page says, for each of them, what a script uses instead.
 
 How a script reaches the model: `ctx.edit(command)` takes any of the kernel's and the add-ons' commands (198 today; `bim_script_reference({ command })` shows one's fields), the kit's helpers build the common ones with typed units, `ctx.model` reads the model as far as the script's reads go, `ctx.calc` runs the engineering calculations on it, `ctx.read` runs the add-ons' computed reads (panel loads, rebalance and room-template plans, duct size advice, catalogues), `ctx.propose` / `ctx.acceptGhosts` place devices by a code's spacing, and the kit's planners (`documents.autoTag`, `autoDimension`, `packSheet`, `oneLine`, `scheduleRows`, `checks.clashes`, `building.surfacesAt`) work on the model as the script has it so far. A script imports only `@permitzip/bim-script` and runs sealed: no files, network or host services.
 
@@ -164,8 +170,8 @@ The `core` family is the catalogue's core pack less the four reads already in th
 | `bim_set_issue_status` | none | host step | issue status is recorded by the host's issuing |
 | `bim_add_sheet_note` | ctx.edit: `create_text_note` | covered | script covers it → retirement candidate (maintainer's call) |
 | `bim_edit_text_note` | ctx.edit: `edit_text_note`, `resize_text_note` | covered | script covers it → retirement candidate (maintainer's call) |
-| `bim_create_3d_view` | ctx.edit: `create_3d_view` | covered | script covers it → retirement candidate (maintainer's call) |
-| `bim_set_3d_view_camera` | ctx.edit: `set_3d_view_camera` | covered | script covers it → retirement candidate (maintainer's call) |
+| `bim_create_3d_view` | `documents.view3d(ctx, spec)` (emits `create_3d_view` with typed units, `lookFrom`, `fovDeg` 5–120°, `projection`, and 3D crop) | covered | script covers it → retirement candidate (maintainer's call) |
+| `bim_set_3d_view_camera` | `documents.setCamera3d(ctx, view, camera)` (emits `set_3d_view_camera`; preserves unspecified fields so `{ fovDeg }` updates the lens cleanly) | covered | script covers it → retirement candidate (maintainer's call) |
 | `bim_set_3d_crop_box` | ctx.edit: `set_3d_crop_box` | covered | script covers it → retirement candidate (maintainer's call) |
 
 ## coordination

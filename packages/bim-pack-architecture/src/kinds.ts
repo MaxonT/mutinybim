@@ -1,4 +1,5 @@
-import { elementsOfKind, hostVoidsOf, type BimElement, type ElementKindItem, type FacePair, type KindSolidShape, type PlanGraphic, type SectionGraphic, type SurfaceFaceRow, type Vec2 } from "@permitzip/bim-kernel";
+import { elementsOfKind, hostVoidsOf, isBuildingStoryLevel, type BimElement, type ElementKindItem, type FacePair, type KindSolidShape, type PlanGraphic, type SectionGraphic, type SurfaceFaceRow, type Vec2 } from "@permitzip/bim-kernel";
+import { RAILING_KIND_ROW } from "./railing";
 
 /**
  * The Architecture add-on's own kinds: roofs and stairs.
@@ -162,9 +163,14 @@ function elevationOf(elements: Elements, levelId: string): number | null {
 function levelAbove(elements: Elements, levelId: string): string | null {
   const z = elevationOf(elements, levelId);
   if (z === null) return null;
-  let best: { id: string; z: number } | null = null;
-  for (const l of elementsOfKind(elements, "level")) if (l.elevationMm > z && (!best || l.elevationMm < best.z)) best = { id: l.id, z: l.elevationMm };
-  return best?.id ?? null;
+  let bestStory: { id: string; z: number } | null = null;
+  let bestAny: { id: string; z: number } | null = null;
+  for (const l of elementsOfKind(elements, "level")) {
+    if (l.elevationMm <= z) continue;
+    if (!bestAny || l.elevationMm < bestAny.z) bestAny = { id: l.id, z: l.elevationMm };
+    if (isBuildingStoryLevel(l) && (!bestStory || l.elevationMm < bestStory.z)) bestStory = { id: l.id, z: l.elevationMm };
+  }
+  return (bestStory ?? bestAny)?.id ?? null;
 }
 
 /** How a stair climbs: from its level to the one above. Null when it has nowhere to rise to. */
@@ -756,6 +762,32 @@ export const STAIR_KIND_ROW: ElementKindItem = {
       y: f.start.y + f.u.y * d + f.n.y * halfW * side,
     });
 
+    // Reflected Ceiling Plan (looking up): draw clean dashed stairwell soffit/opening outline only —
+    // never floor-plan treads, floor cut break lines, or UP/DN arrows.
+    if (ctx.lookingUp) {
+      for (const land of layout.landings) {
+        out.push({
+          form: "polyline",
+          points: [...land.outline],
+          closed: true,
+          pen: "thin",
+          dash: "hidden",
+          tone: "halftone",
+        });
+      }
+      for (const f of layout.flights) {
+        out.push({
+          form: "polyline",
+          points: [flightAt(f, 0, 1), flightAt(f, f.runMm, 1), flightAt(f, f.runMm, -1), flightAt(f, 0, -1)],
+          closed: true,
+          pen: "thin",
+          dash: "hidden",
+          tone: "halftone",
+        });
+      }
+      return out;
+    }
+
     // 1. Opaque white masks + outer carriage/stringer outlines for landings and flights
     for (const land of layout.landings) {
       out.push({
@@ -795,31 +827,28 @@ export const STAIR_KIND_ROW: ElementKindItem = {
           out.push({ form: "line", a: flightAt(f, d, 1), b: flightAt(f, d, -1), pen: "thin" });
         }
       } else if (fi === 0) {
-        const cutRatio = multiFlight ? 0.68 : 0.48;
+        const cutRatio = multiFlight ? 0.64 : 0.48;
         const cutD = f.runMm * cutRatio;
-        const skew = Math.min(halfW * 0.42, f.treadMm * 1.0);
+        const skew = Math.min(halfW * 0.45, f.treadMm * 1.15);
         for (let i = 1; i < f.treads; i++) {
           const d = i * f.treadMm;
-          const aboveCut = d > cutD + skew * 0.5;
-          out.push({ form: "line", a: flightAt(f, d, 1), b: flightAt(f, d, -1), pen: "thin", ...(aboveCut ? { tone: "halftone" as const } : {}) });
+          const aboveCut = d > cutD + skew * 0.45;
+          out.push({
+            form: "line",
+            a: flightAt(f, d, 1),
+            b: flightAt(f, d, -1),
+            pen: "thin",
+            ...(aboveCut ? { dash: "hidden" as const, tone: "halftone" as const } : {}),
+          });
         }
-        const zig = Math.min(90, f.treadMm * 0.35);
-        out.push({
-          form: "polyline",
-          points: [
-            flightAt(f, cutD - skew, -1.08),
-            flightAt(f, cutD - zig * 0.6, -0.15),
-            flightAt(f, cutD + zig * 0.8, 0.05),
-            flightAt(f, cutD - zig * 0.8, 0.15),
-            flightAt(f, cutD + skew, 1.08),
-          ],
-          closed: false,
-          pen: "medium",
-        });
+        // Clean AIA double diagonal stair break line across the flight
+        const gap = Math.min(70, f.treadMm * 0.25);
+        out.push({ form: "line", a: flightAt(f, cutD - skew - gap, -1.06), b: flightAt(f, cutD + skew - gap, 1.06), pen: "medium" });
+        out.push({ form: "line", a: flightAt(f, cutD - skew + gap, -1.06), b: flightAt(f, cutD + skew + gap, 1.06), pen: "medium" });
       } else {
         for (let i = 1; i < f.treads; i++) {
           const d = i * f.treadMm;
-          out.push({ form: "line", a: flightAt(f, d, 1), b: flightAt(f, d, -1), pen: "thin", tone: "halftone" });
+          out.push({ form: "line", a: flightAt(f, d, 1), b: flightAt(f, d, -1), pen: "thin", dash: "hidden", tone: "halftone" });
         }
       }
     }
@@ -974,4 +1003,4 @@ export const STAIR_KIND_ROW: ElementKindItem = {
   },
 };
 
-export const ARCHITECTURE_KIND_ROWS: readonly ElementKindItem[] = [ROOF_KIND_ROW, STAIR_KIND_ROW];
+export const ARCHITECTURE_KIND_ROWS: readonly ElementKindItem[] = [ROOF_KIND_ROW, STAIR_KIND_ROW, RAILING_KIND_ROW];

@@ -18,7 +18,7 @@ import { FIRST_PARTY_ADDONS as FIRST_PARTY_PACKS } from "@permitzip/bim-first-pa
 import { ELECTRICAL_COMPONENTS, ELECTRICAL_PLAN_SYMBOLS, electricalAdapter } from "@permitzip/bim-pack-electrical";
 import { NETWORK_ADAPTER_POINT, adapterForService, networkAdapterOwner, tradeAdapter } from "../src/connections/model";
 import { plumbingAdapter } from "@permitzip/bim-pack-plumbing";
-import { mechanicalAdapter } from "@permitzip/bim-pack-mechanical";
+import { MECHANICAL_DETAIL_SYMBOLS, mechanicalAdapter } from "@permitzip/bim-pack-mechanical";
 import type { TradeAdapter } from "../src/connections/adapter";
 import { BUILTIN_SERVICE_REGISTRY, SERVICE_POINT, activeServiceRegistry, firstPartyServiceRegistry, serviceById, serviceLabel, serviceRowOwner } from "../src/services/registry";
 import type { ServiceRow } from "../src/services/builtin";
@@ -58,8 +58,8 @@ describe("c5p kernel points outside any scope: what they answered before packs",
     expect(tradeAdapter("plumbing")).toBe(plumbingAdapter);
     expect(tradeAdapter("mechanical")).toBe(mechanicalAdapter);
     expect(adapterForService("sanitary")).toBe(plumbingAdapter);
-    // Round 14: Structural is first-party, so its load path follows the three trades.
-    expect(activePackSet().items(NETWORK_ADAPTER_POINT).map((a) => a.id)).toEqual(["electrical", "plumbing", "mechanical", "struct.load_path"]);
+    // Round 14: Structural is first-party, and Civil follows with its storm adapter.
+    expect(activePackSet().items(NETWORK_ADAPTER_POINT).map((a) => a.id)).toEqual(["electrical", "plumbing", "mechanical", "struct.load_path", "civil.storm_network"]);
     expect(NETWORK_ADAPTER_POINT.builtins).toBeUndefined();
     expect(tradeAdapter("zz.slurry_flow")).toBeNull();
   });
@@ -71,10 +71,14 @@ describe("c5p kernel points outside any scope: what they answered before packs",
     for (const [id, row] of BUILTIN_SERVICE_REGISTRY.byId) expect(services.byId.get(id)).toBe(row);
     expect([...BUILTIN_SERVICE_REGISTRY.byId.keys()]).toEqual(["other"]);
     for (const pack of FIRST_PARTY_PACKS) for (const c of pack.contributions) if (c.pointId === SERVICE_POINT.id) for (const row of c.items as readonly ServiceRow[]) expect(services.byId.get(row.id)).toBe(row);
-    expect([...services.byId.keys()].filter((id) => /[.:]/.test(id))).toEqual(["struct.gravity_load"]);
+    expect([...services.byId.keys()].filter((id) => /[.:]/.test(id))).toEqual(["struct.gravity_load", "civil.storm"]);
     expect(activeFacetRegistry()).toBe(BUILTIN_FACET_REGISTRY);
     expect(BUILTIN_SYMBOL_REGISTRY.rows).toEqual([]);
-    expect(activeSymbolRegistry().rows.map((r) => r.id)).toEqual([...ELECTRICAL_COMPONENTS.map((c) => c.id), ...ELECTRICAL_PLAN_SYMBOLS.map((s) => s.id)]);
+    expect(activeSymbolRegistry().rows.map((r) => r.id)).toEqual([
+      ...ELECTRICAL_COMPONENTS.map((c) => c.id),
+      ...ELECTRICAL_PLAN_SYMBOLS.map((s) => s.id),
+      ...MECHANICAL_DETAIL_SYMBOLS.map((s) => s.id),
+    ]);
     expect(activeSymbolRegistry()).toBe(activeSymbolRegistry());
     expect(activeCategoryRegistry()).toBe(builtinCategoryRegistry());
     expect(activeClassRegistry()).toBe(builtinRegistry());
@@ -104,6 +108,8 @@ describe("c5p kernel points outside any scope: what they answered before packs",
       ["architecture", true, false],
       // Round 14: Structural, first-party, with its load path.
       ["struct", true, true],
+      // Civil, first-party, with its storm drainage network.
+      ["civil", true, true],
     ]);
     expect(networkAdapterOwner({ id: "electrical" })).toBe("electrical");
     expect(networkAdapterOwner({ id: "plumbing" })).toBe("plumbing_gas");

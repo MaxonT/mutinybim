@@ -18,8 +18,13 @@ import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { CORE_TOOLS, CORE_TOOL_BUDGET, PACK_CONTROL_TOOL, toolFamily } from "@permitzip/bim-mcp";
 import { createApp, type App } from "../src/app";
 import { approvalTitle } from "../src/assistant-approvals";
+import { checkAuthorize, redirectUriMatches } from "../src/assistant-auth";
 import { HOSTED_PROJECT_ID } from "../src/assistant-tools";
 import type { WebConfig } from "../src/config";
+import { openDb } from "../src/db";
+import { DatabaseSync } from "node:sqlite";
+import { shareByInvitation } from "../__fixtures__/invitation";
+import { seedTeamShare } from "../__fixtures__/team-share";
 
 let dataDir = "";
 let app: App | null = null;
@@ -71,13 +76,14 @@ function pkce(): { verifier: string; challenge: string } {
 }
 
 /** The whole sign-in an assistant does: register, the person allows, the code for tokens. */
-async function signInAssistant(cookie: string, resource = `${base}/mcp`): Promise<{ clientId: string; access: string; refresh: string }> {
+async function signInAssistant(cookie: string, resource = `${base}/mcp`): Promise<{ clientId: string; access: string; refresh: string; consentHtml: string }> {
   const registered = (await (await register()).json()) as { client_id: string };
   const { verifier, challenge } = pkce();
   const params = new URLSearchParams({ response_type: "code", client_id: registered.client_id, redirect_uri: REDIRECT, code_challenge: challenge, code_challenge_method: "S256", state: "s-1", scope: "models", resource });
   const consent = await fetch(`${base}/oauth/authorize?${params}`, { headers: { cookie } });
   expect(consent.status).toBe(200);
-  expect(await consent.text()).toContain("Let “Test Assistant” use your models?");
+  const consentHtml = await consent.text();
+  expect(consentHtml).toContain("Let “Test Assistant” use your models?");
   // The browser checks form-action on every redirect after Allow, and an assistant's callback can go on to its app scheme.
   expect(consent.headers.get("content-security-policy")).not.toContain("form-action");
   const allowed = await post("/oauth/authorize", { request: params.toString(), decision: "allow" }, cookie);
@@ -102,7 +108,7 @@ async function signInAssistant(cookie: string, resource = `${base}/mcp`): Promis
   expect(tokens.expires_in).toBe(3600);
   const reused = await fetch(`${base}/oauth/token`, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ grant_type: "authorization_code", code: code2, redirect_uri: REDIRECT, client_id: registered.client_id, code_verifier: verifier }).toString() });
   expect(reused.status).toBe(400);
-  return { clientId: registered.client_id, access: tokens.access_token, refresh: tokens.refresh_token };
+  return { clientId: registered.client_id, access: tokens.access_token, refresh: tokens.refresh_token, consentHtml };
 }
 
 async function connect(access: string, pathname = "/mcp", elicit?: (message: string) => "accept" | "decline" | Promise<"accept" | "decline">): Promise<Client> {
@@ -362,11 +368,39 @@ test("an approval's title names the model and what changes, never the model's id
   expect(approvalTitle({ summary: "save 2 part types (Fan, Coil) and the script version to the library", modelId: "", modelName: "your script library" })).toBe("Save 2 part types (Fan, Coil) and the script version to the library");
 });
 
+test("an assistant lists East plant once and reads its new role in the same session", async () => {
+  const alex = await signUp("alex@example.test", "Alex");
+  const bea = await signUp("bea@example.test", "Bea");
+  const modelId = await makeModel(alex, "East plant");
+  const alexId = (await app?.db.userByEmail("alex@example.test"))?.id;
+  const beaId = (await app?.db.userByEmail("bea@example.test"))?.id;
+  if (!alexId || !beaId || !app) throw new Error("Missing fixture accounts");
+  const sqlitePath = path.join(dataDir, "accounts.sqlite");
+  seedTeamShare(sqlitePath, { id: "mech", name: "Mechanical", ownerId: alexId, memberId: beaId, modelId, role: "edit" });
+  await shareByInvitation(base, dataDir, { owner: alex, recipient: bea, modelId, email: "bea@example.test", role: "view" });
+  await app.db.transfers.offer("open-offer", modelId, alexId, beaId, "none");
+  const { access, consentHtml } = await signInAssistant(bea);
+  expect(consentHtml).toContain("and the 1 shared with you");
+  const client = await connect(access);
+  try {
+    const listing = () => client.callTool({ name: "bim_model_summary", arguments: { model_id: "list" } }).then(textOf);
+    expect(client.getInstructions()).toContain("you can edit, shared by Alex, via Mechanical");
+    expect((await listing()).match(/East plant/g)).toHaveLength(1);
+    const db = new DatabaseSync(sqlitePath);
+    try { db.prepare("DELETE FROM team_shares WHERE team_id = ? AND model_id = ?").run("mech", modelId); }
+    finally { db.close(); }
+    const changed = await listing();
+    expect(changed).toContain(`East plant (model_id ${modelId}, view only, shared by Alex)`);
+    expect(changed).not.toContain("Mechanical");
+    expect(await app.db.transfers.respond("open-offer", beaId, "accept", 5)).toMatchObject({ state: "accepted" });
+  } finally { await client.close(); }
+}, 30_000);
+
 test("a model shared view-only: the assistant reads it but can't change it, and is never asked to approve", async () => {
   const sam = await signUp("sam@example.com", "Sam Example");
   const modelId = await makeModel(sam, "Sample Warehouse");
   const pat = await signUp("pat@example.com", "Pat Example");
-  expect((await post(`/models/${modelId}/share`, { email: "pat@example.com", role: "view" }, sam)).status).toBeLessThan(400);
+  await shareByInvitation(base, dataDir, { owner: sam, recipient: pat, modelId, email: "pat@example.com", role: "view" });
   const strangerModel = await makeModel(sam, "Not shared");
 
   const { access } = await signInAssistant(pat);
@@ -503,4 +537,157 @@ test("a metadata document that prefers private_key_jwt but supports none signs i
   expect(ok.status).toBe(200);
   const refused = await fetch(`${base}/oauth/authorize?${new URLSearchParams({ response_type: "code", client_id: keyOnly, redirect_uri: REDIRECT, code_challenge: challenge, code_challenge_method: "S256" })}`, { headers: { cookie } });
   expect(refused.status).toBe(400);
+});
+
+test("when a metadata address answers 403, pinned Claude and Claude Code still complete sign-in (with ephemeral loopback ports); a live document always wins once reachable", async () => {
+  await app?.close();
+  const claude = "https://claude.ai/oauth/mcp-oauth-client-metadata";
+  const claudeCallback = "https://claude.ai/api/mcp/auth_callback";
+  const claudeCode = "https://claude.ai/oauth/claude-code-client-metadata";
+  let liveClaude = false;
+  const probe = createApp(config(0), { editor: false });
+  await new Promise<void>((resolve) => probe.server.listen(0, "127.0.0.1", resolve));
+  const address = probe.server.address();
+  if (!address || typeof address === "string") throw new Error("no port");
+  await probe.close();
+  app = createApp(config(address.port), {
+    editor: false,
+    resolveHost: async () => ["203.0.113.7"],
+    fetchImpl: async (url) => {
+      if (liveClaude && url === claude) {
+        return new Response(JSON.stringify({ client_id: claude, client_name: "Claude Live", redirect_uris: [claudeCallback], token_endpoint_auth_method: "none" }), { status: 200 });
+      }
+      return new Response("Forbidden", { status: 403 });
+    },
+  });
+  await app.listen();
+  base = `http://127.0.0.1:${address.port}`;
+  const cookie = await signUp("sam@example.com", "Sam Example");
+  const authParams = (id: string, redirect: string, challenge: string) =>
+    new URLSearchParams({ response_type: "code", client_id: id, redirect_uri: redirect, code_challenge: challenge, code_challenge_method: "S256", scope: "models", resource: `${base}/mcp` });
+
+  // Claude (hosted web/Desktop/iOS/Cowork): pinned fallback works end-to-end when claude.ai answers 403.
+  const claudePkce = pkce();
+  const claudeReq = authParams(claude, claudeCallback, claudePkce.challenge);
+  const claudeConsent = await fetch(`${base}/oauth/authorize?${claudeReq}`, { headers: { cookie } });
+  expect(claudeConsent.status).toBe(200);
+  expect(await claudeConsent.text()).toContain("Let “Claude” use your models?");
+  const claudeAllowed = await post("/oauth/authorize", { request: claudeReq.toString(), decision: "allow" }, cookie);
+  expect(claudeAllowed.status).toBe(303);
+  const claudeCodeParam = new URL(claudeAllowed.headers.get("location") ?? "").searchParams.get("code") ?? "";
+  const claudeToken = await fetch(`${base}/oauth/token`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ grant_type: "authorization_code", code: claudeCodeParam, redirect_uri: claudeCallback, client_id: claude, code_verifier: claudePkce.verifier, resource: `${base}/mcp` }).toString(),
+  });
+  expect(claudeToken.status).toBe(200);
+  const claudeAccess = ((await claudeToken.json()) as { access_token: string }).access_token;
+  const claudeClient = await connect(claudeAccess);
+  expect((await claudeClient.listTools()).tools.length).toBeGreaterThan(0);
+  await claudeClient.close();
+
+  // Claude is still locked to its exact published callback (no arbitrary URL, no non-loopback port swap).
+  const elsewhere = await fetch(`${base}/oauth/authorize?${authParams(claude, REDIRECT, pkce().challenge)}`, { headers: { cookie } });
+  expect(elsewhere.status).toBe(400);
+  expect(await elsewhere.text()).toContain("an address it didn&#x27;t register");
+  const wrongPort = await fetch(`${base}/oauth/authorize?${authParams(claude, "https://claude.ai:8443/api/mcp/auth_callback", pkce().challenge)}`, { headers: { cookie } });
+  expect(wrongPort.status).toBe(400);
+
+  // Claude Code: pinned fallback + ephemeral loopback port matching (localhost and 127.0.0.1).
+  const codePkce = pkce();
+  const codeCallback = "http://localhost:3118/callback";
+  const codeReq = authParams(claudeCode, codeCallback, codePkce.challenge);
+  const codeConsent = await fetch(`${base}/oauth/authorize?${codeReq}`, { headers: { cookie } });
+  expect(codeConsent.status).toBe(200);
+  const codeHtml = await codeConsent.text();
+  expect(codeHtml).toContain("Let “Claude Code” use your models?");
+  expect(codeHtml).toContain("localhost:3118");
+  const codeAllowed = await post("/oauth/authorize", { request: codeReq.toString(), decision: "allow" }, cookie);
+  expect(codeAllowed.status).toBe(303);
+  const codeBack = new URL(codeAllowed.headers.get("location") ?? "");
+  expect(`${codeBack.origin}${codeBack.pathname}`).toBe(codeCallback);
+  const authCode = codeBack.searchParams.get("code") ?? "";
+  // Token exchange still requires the exact redirect_uri (including port) used at /oauth/authorize.
+  const wrongTokenPort = await fetch(`${base}/oauth/token`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ grant_type: "authorization_code", code: authCode, redirect_uri: "http://localhost:9999/callback", client_id: claudeCode, code_verifier: codePkce.verifier }).toString(),
+  });
+  expect(wrongTokenPort.status).toBe(400);
+  const codeAllowed2 = await post("/oauth/authorize", { request: codeReq.toString(), decision: "allow" }, cookie);
+  const authCode2 = new URL(codeAllowed2.headers.get("location") ?? "").searchParams.get("code") ?? "";
+  const codeToken = await fetch(`${base}/oauth/token`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ grant_type: "authorization_code", code: authCode2, redirect_uri: codeCallback, client_id: claudeCode, code_verifier: codePkce.verifier, resource: `${base}/mcp` }).toString(),
+  });
+  expect(codeToken.status).toBe(200);
+  expect((await fetch(`${base}/oauth/authorize?${authParams(claudeCode, "http://127.0.0.1:54321/callback", pkce().challenge)}`, { headers: { cookie } })).status).toBe(200);
+  expect((await fetch(`${base}/oauth/authorize?${authParams(claudeCode, "http://localhost:3118/other", pkce().challenge)}`, { headers: { cookie } })).status).toBe(400);
+  expect((await fetch(`${base}/oauth/authorize?${authParams(claudeCode, "http://[::1]:3118/callback", pkce().challenge)}`, { headers: { cookie } })).status).toBe(400);
+
+  // Connect page shows both assistants by name, not "An assistant".
+  const connectHtml = await (await fetch(`${base}/connect`, { headers: { cookie } })).text();
+  expect(connectHtml).toContain("Claude");
+  expect(connectHtml).toContain("Claude Code");
+
+  // Unknown assistants still see the real fetch error.
+  const unknown = await fetch(`${base}/oauth/authorize?${authParams("https://assistant.example/mcp-client.json", REDIRECT, pkce().challenge)}`, { headers: { cookie } });
+  expect(unknown.status).toBe(400);
+  expect(await unknown.text()).toContain("metadata answered 403");
+
+  // Because the pin is not persisted, a live document takes effect right away once claude.ai answers 200.
+  liveClaude = true;
+  const liveConsent = await fetch(`${base}/oauth/authorize?${authParams(claude, claudeCallback, pkce().challenge)}`, { headers: { cookie } });
+  expect(liveConsent.status).toBe(200);
+  expect(await liveConsent.text()).toContain("Let “Claude Live” use your models?");
+}, 30_000);
+
+test("stale cached metadata survives a failed refresh, and loopback redirect matching follows RFC 8252 + localhost", async () => {
+  expect(redirectUriMatches("http://127.0.0.1/callback", "http://127.0.0.1:43210/callback")).toBe(true);
+  expect(redirectUriMatches("http://[::1]/callback", "http://[::1]:43210/callback")).toBe(true);
+  expect(redirectUriMatches("http://localhost/callback", "http://localhost:3118/callback")).toBe(true);
+  expect(redirectUriMatches("http://localhost/callback", "http://127.0.0.1:3118/callback")).toBe(false);
+  expect(redirectUriMatches("http://localhost/callback", "http://localhost:3118/callback?extra=1")).toBe(false);
+  expect(redirectUriMatches("http://localhost/callback", "http://localhost:3118/callback#frag")).toBe(false);
+  expect(redirectUriMatches("http://localhost/callback", "http://user@localhost:3118/callback")).toBe(false);
+  expect(redirectUriMatches("https://localhost/callback", "https://localhost:3118/callback")).toBe(false);
+  expect(redirectUriMatches("https://claude.ai/api/mcp/auth_callback", "https://claude.ai/api/mcp/auth_callback")).toBe(true);
+
+  const db = openDb(":memory:");
+  try {
+    const clientId = "https://assistant.example/oauth/stale-client.json";
+    await db.saveAssistantClient({ clientId, clientName: "Cached Assistant", redirectUris: [REDIRECT], kind: "metadata" });
+    const staleDb = {
+      ...db,
+      async assistantClient(id: string) {
+        const row = await db.assistantClient(id);
+        return row ? { ...row, created_at: "2020-01-01T00:00:00.000Z" } : null;
+      },
+    };
+    const params = new URLSearchParams({ response_type: "code", client_id: clientId, redirect_uri: REDIRECT, code_challenge: pkce().challenge, code_challenge_method: "S256" });
+    const on403 = await checkAuthorize(params, {
+      origin: "https://app.example",
+      families: [],
+      db: staleDb,
+      resolveHost: async () => ["203.0.113.7"],
+      fetchImpl: async () => new Response("Forbidden", { status: 403 }),
+    });
+    expect(on403.ok).toBe(true);
+    if (on403.ok) expect(on403.request.client.client_name).toBe("Cached Assistant");
+
+    const onError = await checkAuthorize(params, {
+      origin: "https://app.example",
+      families: [],
+      db: staleDb,
+      resolveHost: async () => ["203.0.113.7"],
+      fetchImpl: async () => {
+        throw new Error("ECONNRESET");
+      },
+    });
+    expect(onError.ok).toBe(true);
+    if (onError.ok) expect(onError.request.client.client_name).toBe("Cached Assistant");
+  } finally {
+    await db.close();
+  }
 });
